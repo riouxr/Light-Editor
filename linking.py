@@ -607,13 +607,8 @@ class LL_PT_Panel(bpy.types.Panel):
     
     def draw(self, context):
         layout = self.layout
-        
-        # Check if the render engine is Eevee or EEVEEE
-        if context.scene.render.engine in {'BLENDER_EEVEE_NEXT'}:
-            layout.label(text="Light Linking is not supported in EEVEE", icon='ERROR')
-            return
-
         scene = context.scene
+
         main_row = layout.row(align=True)
         
         col_lights = main_row.column(align=True)
@@ -636,17 +631,17 @@ class LL_PT_Panel(bpy.types.Panel):
         col_light_ops = op_row.column(align=True)
         col_light_ops.operator("ll_editor.refresh_selected_lights", text="Selected Lights")
         col_light_ops.operator("ll_editor.refresh_all_lights", text="All Visible Lights")
-        col_light_ops.operator("ll_editor.reset_lights", text="Deselect All")
+        col_light_ops.operator("ll_editor.reset_lights", text="Reset")
         
         col_mesh_ops = op_row.column(align=True)
         col_mesh_ops.operator("ll_editor.refresh_selected_meshes", text="Selected Meshes")
         col_mesh_ops.operator("ll_editor.refresh_all_meshes", text="All Meshes")
-        col_mesh_ops.operator("ll_editor.reset_meshes", text="Deselect All")
+        col_mesh_ops.operator("ll_editor.reset_meshes", text="Reset")
         
         col_coll_ops = op_row.column(align=True)
         col_coll_ops.operator("ll_editor.refresh_selected_collections", text="Selected Collections")
         col_coll_ops.operator("ll_editor.refresh_all_collections", text="All Collections")
-        col_coll_ops.operator("ll_editor.reset_collections", text="Deselect All")
+        col_coll_ops.operator("ll_editor.reset_collections", text="Reset")
         
         layout.separator()
         link_row = layout.row(align=True)

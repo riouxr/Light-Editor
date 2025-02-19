@@ -10,6 +10,7 @@ from bpy.props import (
 from bpy.app.handlers import persistent
 from bpy.app.translations import contexts as i18n_contexts
 import re, os
+from . icons import get_icon_id
 
 # Global variables to track active checkboxes
 current_active_light = None
@@ -454,8 +455,8 @@ def draw_main_row(box, obj):
     controls_row.prop(obj, "light_turn_off_others", text="",
             icon="RADIOBUT_ON" if obj.light_turn_off_others else "RADIOBUT_OFF")
     if not scene.filter_light_types == 'GROUP':
-        selected_true = custom_icons["SELECT_TRUE"].icon_id
-        selected_false = custom_icons["SELECT_FALSE"].icon_id
+        selected_true = get_icon_id("select_true")
+        selected_false = get_icon_id("select_false")
         controls_row.operator("le.select_light", text="",
                 icon_value=selected_true if obj.select_get() else selected_false).name = obj.name
     if not scene.filter_light_types == 'GROUP':
@@ -648,19 +649,6 @@ def LE_clear_handler(dummy):
                     context.view_layer.objects[obj.name].light_enabled = False
 
 # -------------------------------------------------------------------------
-# Icon Loading
-# -------------------------------------------------------------------------
-def icon_Load():
-    import bpy.utils.previews
-    global custom_icons
-    custom_icons = bpy.utils.previews.new()
-    icons_dir = os.path.join(os.path.dirname(__file__), 'icons')
-    custom_icons.load("SELECT_TRUE", os.path.join(icons_dir, "select_true.png"), 'IMAGE')
-    custom_icons.load("SELECT_FALSE", os.path.join(icons_dir, "select_false.png"), 'IMAGE')
-
-custom_icons = None
-
-# -------------------------------------------------------------------------
 # Registration
 # -------------------------------------------------------------------------
 classes = (
@@ -674,7 +662,6 @@ classes = (
 )
 
 def register():
-    icon_Load()
     print("Light Editor add-on registered successfully.")
     bpy.types.Scene.current_active_light = bpy.props.PointerProperty(type=bpy.types.Object)
     bpy.types.Scene.current_exclusive_group = bpy.props.StringProperty()

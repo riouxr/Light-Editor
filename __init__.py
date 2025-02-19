@@ -4,7 +4,7 @@ bl_info = {
     "location": "3Dview > Light Editor",
     "version": (1, 9, 7),
     "blender": (4, 2, 0),
-    "description": "A Light Editor and Light Linking addon",
+    "description": "A Light Editor and Light linking addon",
     "category": "Object",
 }
 
@@ -12,20 +12,24 @@ bl_info = {
 import bpy
 
 # Import your submodules:
-from . import LightEditor
-from . import Linking
-from . import LightGroup
+from . import lighteditor
+from . import linking
+from . import lightgroup
+from . icons import initialize_icons_collection, unload_icons
 
 def register():
-    LightEditor.register()
-    Linking.register()
-    LightGroup.register()
+    lighteditor.register()
+    linking.register()
+    lightgroup.register()
+    initialize_icons_collection()
 
 def unregister():
     # Unregister in reverse order (best practice)
-    LightGroup.unregister()
-    Linking.unregister()
-    LightEditor.unregister()
+    lightgroup.unregister()
+    linking.unregister()
+    lighteditor.unregister()
+    unload_icons()
+
 
 if __name__ == "__main__":
     register()

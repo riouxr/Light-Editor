@@ -1,10 +1,11 @@
-import bpy
-from bpy.types import Operator, Panel
+import bpy, os
+from bpy.types import Operator, Panel, Menu
 from bpy.props import StringProperty
-
+from . icons import get_icon_id
 # Global dictionaries for group states, moved to Scene for persistence
 bpy.types.Scene.group_collapse_dict = {}
 bpy.types.Scene.group_exclusive_dict = {}
+
 
 # -------------------------------------------------------------------------
 # Render Layer Functions
@@ -39,6 +40,29 @@ class LG_ClearFilter(Operator):
     def execute(self, context):
         context.scene.light_group_filter = ""
         return {'FINISHED'}
+
+
+class LIGHT_MT_lightgroup_context_menu(Menu):
+    bl_label = "LighGroup Specials"
+
+    def draw(self, _context):
+        layout = self.layout
+
+        layout.operator("scene.view_layer_add_used_lightgroups", icon='ADD')
+        layout.operator("scene.view_layer_remove_unused_lightgroups", icon='REMOVE')
+
+        layout.separator()
+        layout.operator(
+            "lg.reset_all_lightgroups",
+            icon='LOOP_BACK',
+            text="Reset All LighGroups",
+        )
+        layout.operator(
+            "lg.remove_all_lightgroups",
+            icon='NONE',
+            text="Delete All LighGroups",
+        )
+
 
 # -------------------------------------------------------------------------
 # Operators
@@ -189,9 +213,61 @@ class LG_RemoveLightGroup(Operator):
             self.report({'WARNING'}, "Lightgroups not available in this Blender version.")
         return {'FINISHED'}
 
+class LG_ResetAllLighgrGroups(Operator):
+    """Remove all lights from any LightGroups."""
+    bl_idname = "lg.reset_all_lightgroups"
+    bl_label = "Reset All LightGroups"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        view_layer = context.view_layer
+        # Unassign lights from the group before removing the group
+        for obj in context.scene.objects:
+            if obj.type == 'LIGHT' and (obj.lightgroup != ""): #getattr(obj, "lightgroup", "") == active_group_name:
+                obj.lightgroup = ""
+
+                # Force redraw panel so lightgroup gets updated
+                for area in context.screen.areas:
+                    if area.type == 'PROPERTIES':
+                        area.tag_redraw()
+
+        else:
+            self.report({'INFO'}, "All Lightgroups cleared.")
+        return {'FINISHED'}
+
+class LG_RemoveAllLighgrGroups(Operator):
+    """Remove all LightGroups."""
+    bl_idname = "lg.remove_all_lightgroups"
+    bl_label = "Remove All the LightGroups in the scene. Also removes them from the lights."
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        view_layer = context.view_layer
+        # Unassign lights from the group before removing the group
+        if hasattr(view_layer, "lightgroups"):
+            for index, item in reversed(list(enumerate(view_layer.lightgroups))):
+                view_layer.active_lightgroup_index = index
+
+                # Use the Blender operator to remove the lightgroup
+                bpy.ops.scene.view_layer_remove_lightgroup()
+
+                # Force redraw panel so lightgroup gets updated
+                for area in context.screen.areas:
+                    if area.type == 'PROPERTIES':
+                        area.tag_redraw()
+
+        else:
+            self.report({'INFO'}, "All Lightgroups Removed.")
+        return {'FINISHED'}
+
 def draw_main_row(box, obj):
     row = box.row(align=True)
-    row.prop(obj, "is_selected", text="", emboss=True, icon='NONE')
+
+    selected_true = get_icon_id("select_true")
+    selected_false = get_icon_id("select_false")
+        # controls_row.operator("le.select_light", text="",
+        #         icon_value=selected_true if obj.select_get() else selected_false).name = obj.name
+    row.prop(obj, "is_selected", text="", emboss=True, icon_value=selected_true if obj.select_get() else selected_false)
     row.prop(obj, "name", text="")
 
 # -------------------------------------------------------------------------
@@ -210,94 +286,95 @@ class LG_PT_LightGroupPanel(Panel):
 
     def draw(self, context):
         layout = self.layout
-
+        
         # Check if the render engine is Eevee
-        if context.scene.render.engine == 'BLENDER_EEVEE':
+        if ((bpy.context.engine == 'BLENDER_EEVEE') or (bpy.context.engine == 'BLENDER_EEVEE_NEXT')):
             layout.label(text="Light Groups are not supported in EEVEE", icon='ERROR')
             return
-
-        # Existing UI code for other engines (e.g., Cycles)
-        view_layer = context.view_layer
-
-        row = layout.row(align=True)
-        col = row.column()
-        if hasattr(view_layer, "lightgroups"):
-            col.template_list("UI_UL_list", "lightgroups", view_layer, "lightgroups",
-                              view_layer, "active_lightgroup_index", rows=3)
-            col = row.column(align=True)
-            col.operator("lg_editor.add_light_group", icon='ADD', text="")
-            col.operator("lg_editor.remove_light_group", icon='REMOVE', text="")
         else:
-            col.label(text="No Lightgroups in this Blender version", icon='ERROR')
+            # Existing UI code for other engines (e.g., Cycles)
+            view_layer = context.view_layer
 
-        row = layout.row(align=True)
-        row.operator("lg_editor.assign_light_group", text="Assign")
-        row.operator("lg_editor.unassign_light_group", text="Unassign")
-        row.operator("lg_editor.reset_light_selection", text="Deselect All")
+            row = layout.row()
+            col = row.column()
+            if hasattr(view_layer, "lightgroups"):
+                col.template_list("UI_UL_list", "lightgroups", view_layer, "lightgroups",
+                                view_layer, "active_lightgroup_index", rows=3)
+                col = row.column(align=True)
+                col.operator("lg_editor.add_light_group", icon='ADD', text="")
+                col.operator("lg_editor.remove_light_group", icon='REMOVE', text="")
 
-        # Add the filter row
-        row = layout.row(align=True)
-        row.prop(context.scene, "light_group_filter", text="", icon="VIEWZOOM")
-        row.operator("lg_editor.clear_filter", text="", icon='PANEL_CLOSE')
-
-        # Add the render layer dropdown
-        row = layout.row()
-        row.prop(context.scene, "selected_render_layer", text="Render Layer")
-
-        groups = {}
-        if hasattr(view_layer, "lightgroups"):
-            for lg in view_layer.lightgroups:
-                lights_in_group = [
-                    obj for obj in context.scene.objects
-                    if obj.type == 'LIGHT'
-                        and not obj.hide_render
-                        and getattr(obj, "lightgroup", "") == lg.name
-                ]
-                groups[lg.name] = lights_in_group
-
-        not_assigned = [
-            obj for obj in context.scene.objects
-            if obj.type == 'LIGHT'
-               and not obj.hide_render
-               and not getattr(obj, "lightgroup", "")
-        ]
-        if not_assigned:
-            groups["Not Assigned"] = not_assigned
-
-        # Filter groups based on the filter text
-        filter_pattern = context.scene.light_group_filter.lower()
-        filtered_groups = {}
-        for grp_name, group_objs in groups.items():
-            if filter_pattern:
-                filtered_objs = [obj for obj in group_objs if filter_pattern in obj.name.lower()]
-                if filtered_objs:
-                    filtered_groups[grp_name] = filtered_objs
+                col.menu("LIGHT_MT_lightgroup_context_menu", icon='DOWNARROW_HLT', text="")
             else:
-                filtered_groups[grp_name] = group_objs
+                col.label(text="No Lightgroups in this Blender version", icon='ERROR')
 
-        for grp_name, group_objs in filtered_groups.items():
-            group_key = f"group_{grp_name}"
-            collapsed = context.scene.group_collapse_dict.get(group_key, False)
-            is_exclusive = context.scene.group_exclusive_dict.get(group_key, False)
+            row = layout.row(align=True)
+            row.operator("lg_editor.assign_light_group", text="Assign")
+            row.operator("lg_editor.unassign_light_group", text="Unassign")
+            row.operator("lg_editor.reset_light_selection", text="Reset")
 
-            header_box = layout.box()
-            header_row = header_box.row(align=True)
+            # Add the filter row
+            row = layout.row(align=True)
+            row.prop(context.scene, "light_group_filter", text="", icon="VIEWZOOM")
+            row.operator("lg_editor.clear_filter", text="", icon='PANEL_CLOSE')
 
-            icon_exclusive = "RADIOBUT_ON" if is_exclusive else "RADIOBUT_OFF"
-            op_exclusive = header_row.operator("lg_editor.toggle_group_exclusive", text="",
-                                               icon=icon_exclusive, emboss=True)
-            op_exclusive.group_key = group_key
+            # Add the render layer dropdown
+            row = layout.row()
+            row.prop(context.scene, "selected_render_layer", text="Render Layer")
 
-            icon_arrow = 'TRIA_DOWN' if not collapsed else 'TRIA_RIGHT'
-            op = header_row.operator("lg_editor.toggle_group", text="", icon=icon_arrow)
-            op.group_key = group_key
+            groups = {}
+            if hasattr(view_layer, "lightgroups"):
+                for lg in view_layer.lightgroups:
+                    lights_in_group = [
+                        obj for obj in context.scene.objects
+                        if obj.type == 'LIGHT'
+                            and not obj.hide_render
+                            and getattr(obj, "lightgroup", "") == lg.name
+                    ]
+                    groups[lg.name] = lights_in_group
 
-            header_row.label(text=grp_name, icon='GROUP')
+            not_assigned = [
+                obj for obj in context.scene.objects
+                if obj.type == 'LIGHT'
+                and not obj.hide_render
+                and not getattr(obj, "lightgroup", "")
+            ]
+            if not_assigned:
+                groups["Not Assigned"] = not_assigned
 
-            if not collapsed:
-                for obj in group_objs:
-                    draw_main_row(header_box, obj)
+            # Filter groups based on the filter text
+            filter_pattern = context.scene.light_group_filter.lower()
+            filtered_groups = {}
+            for grp_name, group_objs in groups.items():
+                if filter_pattern:
+                    filtered_objs = [obj for obj in group_objs if filter_pattern in obj.name.lower()]
+                    if filtered_objs:
+                        filtered_groups[grp_name] = filtered_objs
+                else:
+                    filtered_groups[grp_name] = group_objs
 
+            for grp_name, group_objs in filtered_groups.items():
+                group_key = f"group_{grp_name}"
+                collapsed = context.scene.group_collapse_dict.get(group_key, False)
+                is_exclusive = context.scene.group_exclusive_dict.get(group_key, False)
+
+                header_box = layout.box()
+                header_row = header_box.row(align=True)
+
+                icon_exclusive = "RADIOBUT_ON" if is_exclusive else "RADIOBUT_OFF"
+                op_exclusive = header_row.operator("lg_editor.toggle_group_exclusive", text="",
+                                                icon=icon_exclusive, emboss=True)
+                op_exclusive.group_key = group_key
+
+                icon_arrow = 'TRIA_DOWN' if not collapsed else 'TRIA_RIGHT'
+                op = header_row.operator("lg_editor.toggle_group", text="", icon=icon_arrow)
+                op.group_key = group_key
+
+                header_row.label(text=grp_name, icon='GROUP')
+
+                if not collapsed:
+                    for obj in group_objs:
+                        draw_main_row(header_box, obj)
 
 # -------------------------------------------------------------------------
 # Classes and Registration
@@ -311,11 +388,16 @@ classes = (
     LG_ToggleGroup,
     LG_AddLightGroup,
     LG_RemoveLightGroup,
+    LIGHT_MT_lightgroup_context_menu,
+    LG_ResetAllLighgrGroups,
+    LG_RemoveAllLighgrGroups,
     LG_ClearFilter,
     LG_PT_LightGroupPanel,
 )
-
+ 
 def register():
+    # icon_Load()
+
     bpy.types.Scene.selected_render_layer = bpy.props.EnumProperty(
         name="Render Layer",
         description="Select the render layer",
@@ -340,6 +422,7 @@ def register():
         bpy.utils.register_class(cls)
 
 def unregister():
+    global custom_icons
     del bpy.types.Scene.selected_render_layer
     del bpy.types.Scene.light_group_filter
     del bpy.types.Object.is_selected
