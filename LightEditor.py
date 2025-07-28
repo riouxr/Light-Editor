@@ -1,3 +1,4 @@
+
 import bpy
 import fnmatch
 from bpy.props import (
@@ -8,77 +9,212 @@ from bpy.props import (
     EnumProperty,
 )
 from bpy.app.handlers import persistent
+from bpy.types import Panel
 from bpy.app.translations import contexts as i18n_contexts
+from bpy.types import Light
 import re
 
-# Global variables to track active checkboxes
+# Global variables
 current_active_light = None
-current_exclusive_group = None
+group_checkbox_1_state = {}  # First button on/off per group_key (ON by default)
+group_lights_original_state = {}  # Stores original light states for each group
+group_collapse_dict = {}  # Whether each group is collapsed
+emissive_material_cache = {}
+_emissive_state_backup = {}
 
-# Dictionaries to store states
-group_checkbox_1_state = {}      # First button on/off per group_key (ON by default)
-group_lights_original_state = {} # Stores original light states for each group
-group_checkbox_2_state = {}      # Second button on/off per group_key (OFF by default)
-other_groups_original_state = {} # Stores other groups' states
-group_collapse_dict = {}         # Whether each group is collapsed
-
-
-
-# -------------------------------------------------------------------------
-# 1) Functions for custom light group handling
-# -------------------------------------------------------------------------
-def get_light_groups(context):
-    """
-    Loop through all objects, find lights, and collect them by their custom light group.
-    If a light already has an old "lightgroup" value, it is used.
-    Also include any groups stored in the scene property.
-    Returns a dictionary mapping group names to lists of light object names.
-    """
-    groups = {}
-    for obj in context.view_layer.objects:
-        if obj.type == 'LIGHT':
-            # Try the new property; if empty, fallback to old property.
-            group_val = getattr(obj, "custom_lightgroup", "")
-            if not group_val:
-                group_val = getattr(obj, "lightgroup", "")
-            if group_val:
-                groups.setdefault(group_val, []).append(obj.name)
-    # Get any groups created via the operator (even if no light has that assignment)
+# --- Helper to detect emissive materials on mesh objects ---
+def find_emissive_objects(context):
     scene = context.scene
-    if hasattr(scene, "custom_lightgroups_list") and scene.custom_lightgroups_list:
-        extra_groups = [g.strip() for g in scene.custom_lightgroups_list.split(",") if g.strip()]
-        for g in extra_groups:
-            if g not in groups:
-                groups[g] = []  # no lights assigned yet
-    return groups
+    emissive_objs = []
+    seen = set()
 
-def get_light_group_items(self, context):
-    """Return a list of custom light group items for the EnumProperty."""
-    items = [("NoGroup", "No Group", "")]
-    groups = get_light_groups(context)  # Pass context to get_light_groups
-    for group_name in groups.keys():
-        if group_name != "NoGroup":
-            items.append((group_name, group_name, ""))
-    return items
-def get_light_group_items(self, context):
-    """Return a list of custom light group items for the EnumProperty."""
-    items = [("NoGroup", "No Group", "")]
-    groups = get_light_groups(context)  # Pass context to get_light_groups
-    for group_name in groups.keys():
-        if group_name != "NoGroup":
-            items.append((group_name, group_name, ""))
-    return items
+    def is_emissive_output(node, visited):
+        if node in visited:
+            return False
+        visited.add(node)
+        # Check for EMISSION node
+        if node.type == 'EMISSION':
+            strength_input = node.inputs.get("Strength")
+            return strength_input and strength_input.default_value > 0
+        # Check for BSDF_PRINCIPLED with emission (Updated for 4.0+)
+        if node.type == 'BSDF_PRINCIPLED':
+            emission_input = node.inputs.get("Emission Strength") # 4.0+ name
+            emission_color = node.inputs.get("Emission Color")   # 4.0+ name
+            # Fallback check for older nodes if needed (though find_emissive_objects logic handles this)
+            # if not emission_color:
+            #     emission_color = node.inputs.get("Emission") # Pre-4.0 name
+            return (emission_input and emission_input.default_value > 0) or \
+                   (emission_color and any(emission_color.default_value[:3]))
+        # Recursively check inputs of nodes like MIX_SHADER
+        for input_socket in node.inputs:
+            if input_socket.is_linked:
+                for link in input_socket.links:
+                    if is_emissive_output(link.from_node, visited):
+                        return True
+        return False
 
-def update_lightgroup_menu(self, context):
-    """When the menu selection changes, copy the value into our custom_lightgroup property."""
-    self.custom_lightgroup = self.custom_lightgroup_menu
+    for obj in context.view_layer.objects:
+        if obj.type != 'MESH':
+            continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if not mat or not mat.use_nodes:
+                continue
+            if mat.name in seen:
+                continue
+            seen.add(mat.name)
+            nt = mat.node_tree
+            if not nt:
+                continue
+            output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+            if not output_node:
+                continue
+            surf_input = output_node.inputs.get('Surface')
+            if not surf_input or not surf_input.is_linked:
+                continue
+            from_node = surf_input.links[0].from_node
+            if is_emissive_output(from_node, set()):
+                emissive_objs.append((obj, mat))
+    return emissive_objs
 
-def view_layer_items(self, context):
-    """Return a list of view layer items for the EnumProperty."""
-    items = []
-    for view_layer in context.scene.view_layers:
-        items.append((view_layer.name, view_layer.name, ""))
-    return items
+def draw_emissive_row(box, obj, mat):
+    row = box.row(align=True)
+    # Get emission node or principled BSDF
+    nt = mat.node_tree
+    output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    surf_input = output_node.inputs.get('Surface') if output_node else None
+    from_node = surf_input.links[0].from_node if surf_input and surf_input.is_linked else None
+    emission_node = None
+    principled_node = None
+    color_input = None
+    strength_input = None
+    enabled = False
+
+    def traverse_inputs(node, visited):
+        nonlocal emission_node, principled_node
+        if node in visited:
+            return
+        visited.add(node)
+        if node.type == 'EMISSION':
+            emission_node = node
+        elif node.type == 'BSDF_PRINCIPLED':
+            principled_node = node
+        for input_socket in node.inputs:
+            if input_socket.is_linked:
+                for link in input_socket.links:
+                    traverse_inputs(link.from_node, visited)
+
+    if from_node:
+        traverse_inputs(from_node, set())
+
+    # Explicitly set color_input and strength_input (Updated for 4.0+)
+    if emission_node:
+        color_input = emission_node.inputs.get("Color")
+        strength_input = emission_node.inputs.get("Strength")
+        if strength_input:
+            enabled = strength_input.default_value > 0
+    elif principled_node:
+        # --- CORRECTED: Use "Emission Color" for Blender 4.0+ ---
+        color_input = principled_node.inputs.get("Emission Color") # 4.0+ name
+        strength_input = principled_node.inputs.get("Emission Strength") # 4.0+ name
+
+        # Determine enabled state based on the found inputs (4.0+ logic)
+        if strength_input is not None:
+            # Enabled if Emission Strength > 0
+            enabled = strength_input.default_value > 0
+        elif color_input is not None:
+            # Fallback: Enabled if Emission Color RGB has any value > 0
+            # (Use slicing [:3] to check only RGB, ignore Alpha)
+            enabled = any(channel > 0.0 for channel in color_input.default_value[:3])
+        # If neither input is found (unlikely if find_emissive_objects found it),
+        # enabled remains False or uses the value set previously.
+
+    # Toggle emission
+    icon = 'OUTLINER_OB_LIGHT' if enabled else 'LIGHT_DATA'
+    op = row.operator("le.toggle_emission", text="", icon=icon, depress=enabled)
+    op.mat_name = mat.name
+
+    # Isolate button
+    iso_icon = 'RADIOBUT_ON' if _emissive_state_backup else 'RADIOBUT_OFF'
+    row.operator("le.isolate_emissive", text="", icon=iso_icon).mat_name = mat.name
+
+    # Select object
+    row.operator("le.select_light", text="", icon="RESTRICT_SELECT_OFF").name = obj.name
+
+    # Editable object name
+    obj_col = row.column(align=True)
+    obj_col.scale_x = 0.5
+    obj_col.prop(obj, "name", text="")
+
+    # Editable material name
+    mat_col = row.column(align=True)
+    mat_col.scale_x = 0.5
+    mat_col.prop(mat, "name", text="")
+
+    # --- Emission Color Display ---
+    # --- Emission Color & Strength ---
+    value_row = row.row(align=True)
+
+    col_color = value_row.row(align=True)
+    col_color.ui_units_x = 4
+
+    col_strength = value_row.row(align=True)
+    col_strength.ui_units_x = 6
+
+    # COLOR COLUMN
+    if color_input:
+        if color_input.is_linked:
+            color_row = col_color.row(align=True)
+            color_row.alignment = 'EXPAND'
+            color_row.label(icon='NODETREE')
+            color_row.enabled = False
+            color_row.prop(color_input, "default_value", text="")
+        else:
+            try:
+                col_color.prop(color_input, "default_value", text="")
+            except:
+                col_color.label(text="Col?")
+    else:
+        col_color.label(text="")
+
+    # STRENGTH COLUMN
+    if strength_input:
+        if strength_input.is_linked:
+            strength_row = col_strength.row(align=True)
+            strength_row.alignment = 'EXPAND'
+            strength_row.label(icon='NODETREE')
+            strength_row.enabled = False
+            strength_row.prop(strength_input, "default_value", text="")
+        else:
+            try:
+                col_strength.prop(strength_input, "default_value", text="")
+            except:
+                col_strength.label(text="Str?")
+    else:
+        col_strength.label(text="")
+
+def draw_emissives_section(self, context, layout):
+    scene = context.scene
+    box = layout.box() # Create a box for the emissive section
+
+    # --- Collapsible Header for Emissives ---
+    header_row = box.row(align=True)
+    # Toggle button for collapsing the emissive materials list
+    emissive_collapse_icon = 'RIGHTARROW' if scene.collapse_all_emissives else 'DOWNARROW_HLT'
+    header_row.operator("light_editor.toggle_all_emissives", text="", icon=emissive_collapse_icon, emboss=False)
+    header_row.label(text="All Emissive Materials (Alphabetical)", icon='SHADING_RENDERED')
+
+    # Draw the emissive materials list only if not collapsed
+    if not scene.collapse_all_emissives:
+        emissive_box = box.box() # Optional: sub-box for emissives
+        emissive_pairs = find_emissive_objects(context)
+        sorted_emissive_pairs = sorted(emissive_pairs, key=lambda pair: f"{pair[0].name}_{pair[1].name}".lower())
+
+        if not sorted_emissive_pairs:
+             emissive_box.label(text="No emissive materials found.")
+        else:
+            for obj, mat in sorted_emissive_pairs:
+                draw_emissive_row(emissive_box, obj, mat)
 
 def update_light_enabled(self, context):
     self.hide_viewport = not self.light_enabled
@@ -90,7 +226,6 @@ def update_light_turn_off_others(self, context):
         if scene.current_active_light and scene.current_active_light != self:
             scene.current_active_light.light_turn_off_others = False
         scene.current_active_light = self
-        # Use objects from the active view layer
         for obj in context.view_layer.objects:
             if obj.type == 'LIGHT' and obj.name != self.name:
                 if 'prev_light_enabled' not in obj:
@@ -105,37 +240,24 @@ def update_light_turn_off_others(self, context):
                     obj.light_enabled = obj['prev_light_enabled']
                     del obj['prev_light_enabled']
 
-# --- MUTUALLY EXCLUSIVE GROUPING TOGGLES ---
+def light_editor_tag_redraw(scene, depsgraph):
+    for update in depsgraph.updates:
+        if isinstance(update.id, bpy.types.Light):
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
+                        return
+
 def update_group_by_kind(self, context):
     if self.light_editor_kind_alpha:
         self.light_editor_group_by_collection = False
-        self.light_editor_light_group = False
 
 def update_group_by_collection(self, context):
     if self.light_editor_group_by_collection:
         self.light_editor_kind_alpha = False
-        self.light_editor_light_group = False
 
-def update_light_group(self, context):
-    if self.light_editor_light_group:
-        self.light_editor_kind_alpha = False
-        self.light_editor_group_by_collection = False
-
-        # Collapse all expanded lights when switching to "By Light Groups" mode
-        for obj in context.view_layer.objects:
-            if obj.type == 'LIGHT':
-                obj.light_expanded = False
-
-def update_light_types(self, context):
-    if self == 'group':
-    # Collapse all expanded lights when switching to "By Light Groups" mode
-        for obj in context.view_layer.objects:
-            if obj.type == 'LIGHT':
-                obj.light_expanded = False
-
-# Used for MacOS
 def get_device_type(context):
-    # print(context.preferences.addons['cycles'])
     return context.preferences.addons['cycles'].preferences.compute_device_type
 
 def backend_has_active_gpu(context):
@@ -143,11 +265,9 @@ def backend_has_active_gpu(context):
 
 def use_metal(context):
     cscene = context.scene.cycles
-
     return (get_device_type(context) == 'METAL' and cscene.device == 'GPU' and backend_has_active_gpu(context))
 
 def use_mnee(context):
-    # The MNEE kernel doesn't compile on macOS < 13.
     if use_metal(context):
         import platform
         version, _, _ = platform.mac_ver()
@@ -156,20 +276,11 @@ def use_mnee(context):
             return False
     return True
 
-# -------------------------------------------------------------------------
-# 2) Extra parameters drawing function (unchanged)
-# -------------------------------------------------------------------------
 def draw_extra_params(self, box, obj, light):
-    # layout = self.layout
-    # col = layout.column()
     col = box.column()
-
     col.prop(light, "color")
     col.prop(light, "energy")
     col.separator()
-
-
-    # CYCLES
     if bpy.context.engine == 'CYCLES':
         clamp = light.cycles
         if light.type in {'POINT', 'SPOT'}:
@@ -180,57 +291,43 @@ def draw_extra_params(self, box, obj, light):
         elif light.type == 'AREA':
             col.prop(light, "shape", text="Shape")
             sub = col.column(align=True)
-
             if light.shape in {'SQUARE', 'DISK'}:
                 sub.prop(light, "size")
             elif light.shape in {'RECTANGLE', 'ELLIPSE'}:
                 sub.prop(light, "size", text="Size X")
                 sub.prop(light, "size_y", text="Y")
-
         if not (light.type == 'AREA' and clamp.is_portal):
             col.separator()
             sub = col.column()
             sub.prop(clamp, "max_bounces")
-
         sub = col.column(align=True)
         sub.active = not (light.type == 'AREA' and clamp.is_portal)
         sub.prop(clamp, "cast_shadow")
         sub.prop(clamp, "use_multiple_importance_sampling", text="Multiple Importance")
         if use_mnee(bpy.context):
             sub.prop(clamp, "is_caustics_light", text="Shadow Caustics")
-
         if light.type == 'AREA':
             col.prop(clamp, "is_portal", text="Portal")
-
     if light.type == 'SPOT':
         col.separator()
-        
-        # Create a new row for the label and center-align it
         row = col.row(align=True)
         row.alignment = 'CENTER'
         row.label(text="Spot Shape")
-        
-        # Reset alignment for the properties
         col.alignment = 'RIGHT'
         col.prop(light, "spot_size", text="Beam Size")
         col.prop(light, "spot_blend", text="Blend", slider=True)
         col.prop(light, "show_cone")
-
     elif light.type == 'AREA':
         col.separator()
         row = col.row(align=True)
         row.alignment = 'CENTER'
         row.label(text="Beam Shape")
         col.prop(light, "spread", text="Spread")
-
-    # EEVEE
-    # Compact layout for node editor
-    if ((bpy.context.engine == 'BLENDER_EEVEE') or (bpy.context.engine =='BLENDER_EEVEE_NEXT')):
+    if bpy.context.engine in {'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'}:
         col.separator()
         col.prop(light, "diffuse_factor", text="Diffuse")
         col.prop(light, "specular_factor", text="Specular")
         col.prop(light, "volume_factor", text="Volume", text_ctxt=i18n_contexts.id_id)
-
         col.separator()
         if light.type in {'POINT', 'SPOT'}:
             col.prop(light, "use_soft_falloff")
@@ -239,90 +336,60 @@ def draw_extra_params(self, box, obj, light):
             col.prop(light, "angle")
         elif light.type == 'AREA':
             col.prop(light, "shape")
-
             sub = col.column(align=True)
-
             if light.shape in {'SQUARE', 'DISK'}:
                 sub.prop(light, "size")
             elif light.shape in {'RECTANGLE', 'ELLIPSE'}:
                 sub.prop(light, "size", text="Size X")
                 sub.prop(light, "size_y", text="Y")
-
         if bpy.context.engine == 'BLENDER_EEVEE_NEXT':
             col.separator()
             col.prop(light, "use_shadow", text="Cast Shadow")
             col.prop(light, "shadow_softness_factor", text="Shadow Softness")
-
             if light.type == 'SUN':
                 col.prop(light, "shadow_trace_distance", text="Trace Distance")
-
-        # Custom Distance
-        if (light and light.type != 'SUN'): # and (bpy.context.engine == 'BLENDER_EEVEE' or 'BLENDER_EEVEE_NEXT')):
+        if light.type != 'SUN':
             col.separator()
             sub = col.column()
             sub.prop(light, "use_custom_distance", text="Custom Distance")
-
             sub.active = light.use_custom_distance
             sub.prop(light, "cutoff_distance", text="Distance")
-        
-        # Spot Shape
-        if (light and light.type == 'SPOT'):
+        if light.type == 'SPOT':
             col.separator()
             row = col.row(align=True)
             row.alignment = 'CENTER'
             row.label(text="Spot Shape")
-            
             col.prop(light, "spot_size", text="Size")
             col.prop(light, "spot_blend", text="Blend", slider=True)
             col.prop(light, "show_cone")
-
-        # Shadows
-        if (light and light.type in {'POINT', 'SUN', 'SPOT', 'AREA'}):
-
+        if light.type in {'POINT', 'SUN', 'SPOT', 'AREA'}:
             col.separator()
             subb = col.column()
             subb.prop(light, "use_shadow", text="Shadow")
-
             if light.type != 'SUN':
                 subb.prop(light, "shadow_buffer_clip_start", text="Clip Start")
             subb.prop(light, "shadow_buffer_bias", text="Bias")
             subb.active = light.use_shadow
-
-            # Cascaded Shadow Map
-            if (light and light.type == 'SUN'):
-
+            if light.type == 'SUN':
                 col.separator()
                 col.alignment = 'RIGHT'
                 col.label(text="Cascaded Shadow Map")
                 col.prop(light, "shadow_cascade_count", text="Count")
                 col.prop(light, "shadow_cascade_fade", text="Fade")
-
                 col.prop(light, "shadow_cascade_max_distance", text="Max Distance")
                 col.prop(light, "shadow_cascade_exponent", text="Distribution")
-
-            #Contact Shadows
-            if (
-            (light and light.type in {'POINT', 'SUN', 'SPOT', 'AREA'}) and
-            (bpy.context.engine == 'BLENDER_EEVEE' or 'BLENDER_EEVEE_NEXT')):
-
+            if light.type in {'POINT', 'SUN', 'SPOT', 'AREA'} and bpy.context.engine in {'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'}:
                 col.separator()
                 subbb = col.column()
                 subbb.active = light.use_shadow
                 subbb.prop(light, "use_contact_shadow", text="Contact Shadows")
-
                 col = subbb.column()
                 col.active = light.use_shadow and light.use_contact_shadow
-
                 col.prop(light, "contact_shadow_distance", text="Distance")
                 col.prop(light, "contact_shadow_bias", text="Bias")
                 col.prop(light, "contact_shadow_thickness", text="Thickness")
 
-# -------------------------------------------------------------------------
-# Render layer menu
-# -------------------------------------------------------------------------
-
 def get_render_layer_items(self, context):
-    """Return a list of render layer items for the EnumProperty."""
     items = []
     for view_layer in context.scene.view_layers:
         items.append((view_layer.name, view_layer.name, ""))
@@ -330,77 +397,211 @@ def get_render_layer_items(self, context):
 
 def update_render_layer(self, context):
     selected = self.selected_render_layer
-    # Iterate over the scene’s view layers:
     for vl in context.scene.view_layers:
         if vl.name == selected:
             context.window.view_layer = vl
             break
 
-# -------------------------------------------------------------------------
-# Add a new operator for deleting a light group
-# -------------------------------------------------------------------------
-class LIGHT_OT_DeleteLightGroup(bpy.types.Operator):
-    """Delete the selected light group."""
-    bl_idname = "light_editor.delete_light_group"
-    bl_label = "Delete Light Group"
+class LE_OT_ToggleEmission(bpy.types.Operator):
+    bl_idname = "le.toggle_emission"
+    bl_label = "Toggle Emission"
+    mat_name: bpy.props.StringProperty()
 
     def execute(self, context):
-        scene = context.scene
-        selected_group = scene.light_editor_delete_group
-
-        if selected_group == "NoGroup":
-            self.report({'WARNING'}, "No group selected.")
+        mat = bpy.data.materials.get(self.mat_name)
+        if not mat or not mat.use_nodes:
             return {'CANCELLED'}
+        nt = mat.node_tree
+        emission_node = None
+        principled_node = None
 
-        # Remove the group from all lights (use context.view_layer.objects)
-        for obj in context.view_layer.objects:
-            if obj.type == 'LIGHT' and getattr(obj, "custom_lightgroup", "") == selected_group:
-                obj.custom_lightgroup = ""
-                obj.custom_lightgroup_menu = "NoGroup"
+        def traverse_inputs(node, visited):
+            nonlocal emission_node, principled_node
+            if node in visited:
+                return
+            visited.add(node)
+            if node.type == 'EMISSION':
+                emission_node = node
+            elif node.type == 'BSDF_PRINCIPLED':
+                principled_node = node
+            for input_socket in node.inputs:
+                if input_socket.is_linked:
+                    for link in input_socket.links:
+                        traverse_inputs(link.from_node, visited)
 
-        # Remove the group from the scene's custom_lightgroups_list
-        if hasattr(scene, "custom_lightgroups_list") and scene.custom_lightgroups_list:
-            groups = [g.strip() for g in scene.custom_lightgroups_list.split(",") if g.strip()]
-            if selected_group in groups:
-                groups.remove(selected_group)
-                scene.custom_lightgroups_list = ", ".join(groups)
+        output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+        if output_node:
+            surf_input = output_node.inputs.get('Surface')
+            if surf_input and surf_input.is_linked:
+                traverse_inputs(surf_input.links[0].from_node, set())
 
-        self.report({'INFO'}, f"Deleted light group '{selected_group}'")
+        if emission_node:
+            strength_input = emission_node.inputs.get("Strength")
+            if not strength_input:
+                return {'CANCELLED'}
+            current = strength_input.default_value
+            if current > 0:
+                mat["_original_emission_strength"] = current
+                strength_input.default_value = 0.0
+            else:
+                restored = mat.get("_original_emission_strength", 10.0)
+                strength_input.default_value = restored
+        elif principled_node:
+            # Updated for 4.0+
+            strength_input = principled_node.inputs.get("Emission Strength")
+            color_input = principled_node.inputs.get("Emission Color")
+            # Fallback check for older nodes if needed
+            # if not color_input:
+            #     color_input = principled_node.inputs.get("Emission") # Pre-4.0 name
+
+            if strength_input:
+                current = strength_input.default_value
+                if current > 0:
+                    mat["_original_emission_strength"] = current
+                    strength_input.default_value = 0.0
+                else:
+                    restored = mat.get("_original_emission_strength", 10.0)
+                    strength_input.default_value = restored
+            elif color_input:
+                current = color_input.default_value[:3]
+                if any(current):
+                    mat["_original_emission_color"] = current
+                    color_input.default_value = (0, 0, 0, 1)
+                else:
+                    restored = mat.get("_original_emission_color", (1, 1, 1))
+                    color_input.default_value = restored + (1,)
+        else:
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+class LE_OT_isolate_emissive(bpy.types.Operator):
+    bl_idname = "le.isolate_emissive"
+    bl_label = "Isolate Emissive Material"
+    mat_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        target = bpy.data.materials.get(self.mat_name)
+        if not target:
+            self.report({'WARNING'}, f"Material {self.mat_name} not found")
+            return {'CANCELLED'}
+        global _emissive_state_backup
+        if not _emissive_state_backup:
+            _emissive_state_backup = {}
+            for obj, mat in find_emissive_objects(context):
+                tree = mat.node_tree
+                if not tree:
+                    continue
+                output = next((n for n in tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+                if not output:
+                    continue
+                input_socket = output.inputs.get("Surface")
+                if input_socket and input_socket.is_linked:
+                    emission_node = None
+                    principled_node = None
+
+                    def traverse_inputs(node, visited):
+                        nonlocal emission_node, principled_node
+                        if node in visited:
+                            return
+                        visited.add(node)
+                        if node.type == 'EMISSION':
+                            emission_node = node
+                        elif node.type == 'BSDF_PRINCIPLED':
+                            principled_node = node
+                        for input_socket in node.inputs:
+                            if input_socket.is_linked:
+                                for link in input_socket.links:
+                                    traverse_inputs(link.from_node, visited)
+
+                    traverse_inputs(input_socket.links[0].from_node, set())
+                    # Updated for 4.0+
+                    if emission_node and emission_node.inputs.get("Strength"):
+                        _emissive_state_backup[mat.name] = ('EMISSION', emission_node.inputs["Strength"].default_value)
+                    elif principled_node:
+                        if principled_node.inputs.get("Emission Strength"):
+                            _emissive_state_backup[mat.name] = ('PRINCIPLED', principled_node.inputs["Emission Strength"].default_value)
+                        elif principled_node.inputs.get("Emission Color"): # 4.0+ name
+                            _emissive_state_backup[mat.name] = ('PRINCIPLED_COLOR', principled_node.inputs["Emission Color"].default_value[:]) # 4.0+ name
+                        # Fallback check for older nodes if needed
+                        # elif principled_node.inputs.get("Emission"): # Pre-4.0 name
+                        #     _emissive_state_backup[mat.name] = ('PRINCIPLED_COLOR', principled_node.inputs["Emission"].default_value[:]) # Pre-4.0 name
+            for obj in bpy.data.objects:
+                if obj.type == 'LIGHT':
+                    obj.hide_viewport = True
+                    obj.hide_render = True
+            for name, (node_type, value) in _emissive_state_backup.items():
+                mat = bpy.data.materials.get(name)
+                if not mat or name == self.mat_name:
+                    continue
+                nt = mat.node_tree
+                output = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+                if not output:
+                    continue
+                input_socket = output.inputs.get("Surface")
+                if input_socket and input_socket.is_linked:
+                    emission_node = None
+                    principled_node = None
+                    traverse_inputs(input_socket.links[0].from_node, set())
+                    if node_type == 'EMISSION' and emission_node:
+                        emission_node.inputs["Strength"].default_value = 0
+                    elif node_type == 'PRINCIPLED' and principled_node:
+                        principled_node.inputs["Emission Strength"].default_value = 0
+                    elif node_type == 'PRINCIPLED_COLOR' and principled_node:
+                        # Updated for 4.0+
+                        principled_node.inputs["Emission Color"].default_value = (0, 0, 0, 1) # 4.0+ name
+                        # Fallback check for older nodes if needed
+                        # principled_node.inputs["Emission"].default_value = (0, 0, 0, 1) # Pre-4.0 name
+        else:
+            for name, (node_type, val) in _emissive_state_backup.items():
+                mat = bpy.data.materials.get(name)
+                if not mat:
+                    continue
+                nt = mat.node_tree
+                output = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+                if not output:
+                    continue
+                input_socket = output.inputs.get("Surface")
+                if input_socket and input_socket.is_linked:
+                    emission_node = None
+                    principled_node = None
+                    traverse_inputs(input_socket.links[0].from_node, set())
+                    if node_type == 'EMISSION' and emission_node:
+                        emission_node.inputs["Strength"].default_value = val
+                    elif node_type == 'PRINCIPLED' and principled_node:
+                        principled_node.inputs["Emission Strength"].default_value = val
+                    elif node_type == 'PRINCIPLED_COLOR' and principled_node:
+                        # Updated for 4.0+
+                        principled_node.inputs["Emission Color"].default_value = val + (1,) # 4.0+ name
+                        # Fallback check for older nodes if needed
+                        # principled_node.inputs["Emission"].default_value = val + (1,) # Pre-4.0 name
+            for obj in bpy.data.objects:
+                if obj.type == 'LIGHT':
+                    obj.hide_viewport = False
+                    obj.hide_render = False
+            _emissive_state_backup = {}
+        return {'FINISHED'}
+
+class LIGHT_OT_ToggleAllLightsAlpha(bpy.types.Operator):
+    bl_idname = "light_editor.toggle_all_lights_alpha"
+    bl_label = "Toggle All Lights Alphabetical"
+    bl_description = "Collapse or expand the 'All Lights (Alphabetical)' section"
+
+    def execute(self, context):
+        context.scene.collapse_all_lights_alpha = not context.scene.collapse_all_lights_alpha
+        context.area.tag_redraw() # More direct redraw for the current area
+        return {'FINISHED'}
+
+class LIGHT_OT_ToggleAllEmissivesAlpha(bpy.types.Operator):
+    bl_idname = "light_editor.toggle_all_emissives_alpha"
+    bl_label = "Toggle All Emissive Materials Alphabetical"
+    bl_description = "Collapse or expand the 'All Emissive Materials (Alphabetical)' section"
+
+    def execute(self, context):
+        context.scene.collapse_all_emissives_alpha = not context.scene.collapse_all_emissives_alpha
+        context.area.tag_redraw() # More direct redraw for the current area
         return {'FINISHED'}
     
-# -------------------------------------------------------------------------
-# 3) Operator: Add Lightgroup
-# This operator now works even if no light is selected.
-# When executed it assigns the new group name to the active light (if one exists)
-# or adds the group name to the scene's custom_lightgroups_list.
-# -------------------------------------------------------------------------
-class LIGHT_OT_CreateNewLightgroup(bpy.types.Operator):
-    """Add a new lightgroup."""
-    bl_idname = "light_editor.create_new_lightgroup"
-    bl_label = "Add Lightgroup"
-
-    def execute(self, context):
-        scene = context.scene
-        new_group = scene.create_new_lightgroup.strip()
-
-        if not new_group:
-            self.report({'WARNING'}, "No group name entered.")
-            return {'CANCELLED'}
-
-        # Use Blender's built-in function to add the light group
-        bpy.ops.scene.view_layer_add_lightgroup(name=new_group)
-        self.report({'INFO'}, f"Created light group '{new_group}'")
-
-        # Clear the input field
-        scene.create_new_lightgroup = ""
-
-        return {'FINISHED'}
-
-# -------------------------------------------------------------------------
-# 4) Operators for group toggling (object access updated)
-# -------------------------------------------------------------------------
 class LIGHT_OT_ToggleGroup(bpy.types.Operator):
-    """Collapse or expand a group header."""
     bl_idname = "light_editor.toggle_group"
     bl_label = "Toggle Group"
     group_key: StringProperty()
@@ -414,7 +615,6 @@ class LIGHT_OT_ToggleGroup(bpy.types.Operator):
         return {'FINISHED'}
 
 class LIGHT_OT_ToggleGroupAllOff(bpy.types.Operator):
-    """Toggle all lights in the group off or restore them."""
     bl_idname = "light_editor.toggle_group_all_off"
     bl_label = "Toggle Group All Off"
     group_key: StringProperty()
@@ -447,18 +647,8 @@ class LIGHT_OT_ToggleGroupAllOff(bpy.types.Operator):
         scene = context.scene
         filter_pattern = scene.light_editor_filter.lower()
         if filter_pattern:
-            # all_lights = [obj for obj in context.view_layer.objects
-            #               if obj.type == 'LIGHT' and fnmatch.fnmatch(obj.name.lower(), filter_pattern)]
-            
             all_lights = [obj for obj in context.view_layer.objects
                           if obj.type == 'LIGHT' and re.search(filter_pattern, obj.name, re.I)]
-
-            # for fn in sorted(files):
-            #     if not fn.lower().startswith("._"):
-            #         if fn.lower().endswith(".hdr") or fn.lower().endswith(".exr") or fn.lower().endswith(".jpg") or fn.lower().endswith(".png"):
-            #             if not scn.easyhdr_filter or re.search(scn.easyhdr_filter, fn, re.I):
-            #                 hdris.append(os.path.join(root, fn).replace(dir, ''))
-            #                 no_match = False
         else:
             all_lights = [obj for obj in context.view_layer.objects if obj.type == 'LIGHT']
         if scene.filter_light_types == 'COLLECTION' and group_key.startswith("coll_"):
@@ -469,123 +659,39 @@ class LIGHT_OT_ToggleGroupAllOff(bpy.types.Operator):
         if scene.filter_light_types == 'KIND' and group_key.startswith("kind_"):
             kind = group_key[5:]
             return [obj for obj in all_lights if obj.data.type == kind]
-        if scene.filter_light_types == 'GROUP' and group_key.startswith("group_"):
-            group_name = group_key[6:]
-            return [obj for obj in all_lights if getattr(obj, "custom_lightgroup", "") == group_name]
         return []
 
-class LIGHT_OT_ToggleGroupExclusive(bpy.types.Operator):
-    """
-    Toggle exclusive mode for a group.
-    When turned on, lights in other groups are turned off.
-    """
-    bl_idname = "light_editor.toggle_group_exclusive"
-    bl_label = "Toggle Group Exclusive"
-    group_key: StringProperty()
+# --- New Operator Classes for Collapsing Main Sections ---
+class LIGHT_OT_ToggleAllLights(bpy.types.Operator):
+    bl_idname = "light_editor.toggle_all_lights"
+    bl_label = "Toggle All Lights Section"
+    bl_description = "Collapse or expand the 'All Lights (Alphabetical)' section"
 
     def execute(self, context):
-        global current_exclusive_group, group_checkbox_2_state, other_groups_original_state
-        is_on = group_checkbox_2_state.get(self.group_key, False)
-        if not is_on:
-            if current_exclusive_group and current_exclusive_group != self.group_key:
-                group_checkbox_2_state[current_exclusive_group] = False
-                saved_dict = other_groups_original_state.get(current_exclusive_group, {})
-                for gk, light_dict in saved_dict.items():
-                    grp_objs = self._get_group_objects(context, gk)
-                    for obj in grp_objs:
-                        obj.light_enabled = light_dict.get(obj.name, True)
-                if current_exclusive_group in other_groups_original_state:
-                    del other_groups_original_state[current_exclusive_group]
-            others = self._get_all_other_groups(context, self.group_key)
-            saved_dict = {}
-            for gk in others:
-                grp_objs = self._get_group_objects(context, gk)
-                saved_dict[gk] = {obj.name: obj.light_enabled for obj in grp_objs}
-                for obj in grp_objs:
-                    obj.light_enabled = False
-            other_groups_original_state[self.group_key] = saved_dict
-            group_checkbox_2_state[self.group_key] = True
-            current_exclusive_group = self.group_key
-        else:
-            saved_dict = other_groups_original_state.get(self.group_key, {})
-            for gk, light_dict in saved_dict.items():
-                grp_objs = self._get_group_objects(context, gk)
-                for obj in grp_objs:
-                    obj.light_enabled = light_dict.get(obj.name, True)
-            if self.group_key in other_groups_original_state:
-                del other_groups_original_state[self.group_key]
-            group_checkbox_2_state[self.group_key] = False
-            current_exclusive_group = None
+        context.scene.collapse_all_lights = not context.scene.collapse_all_lights
+        # Redraw the UI
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
         return {'FINISHED'}
 
-    def _get_all_other_groups(self, context, current_key):
-        return [k for k in self._get_all_group_keys(context) if k != current_key]
+class LIGHT_OT_ToggleAllEmissives(bpy.types.Operator):
+    bl_idname = "light_editor.toggle_all_emissives"
+    bl_label = "Toggle All Emissive Materials Section"
+    bl_description = "Collapse or expand the 'All Emissive Materials (Alphabetical)' section"
 
-    def _get_all_group_keys(self, context):
-        scene = context.scene
-        filter_pattern = scene.light_editor_filter.lower()
-        if filter_pattern:
-            lights = [obj for obj in context.view_layer.objects
-                      if obj.type == 'LIGHT' and re.search(filter_pattern, obj.name, re.I)]
-                    #   if obj.type == 'LIGHT' and fnmatch.fnmatch(obj.name.lower(), filter_pattern)]
-        else:
-            lights = [obj for obj in context.view_layer.objects if obj.type == 'LIGHT']
-        group_keys = set()
-        if scene.filter_light_types == 'COLLECTION':
-            for obj in lights:
-                if obj.users_collection:
-                    coll_name = obj.users_collection[0].name
-                else:
-                    coll_name = "No Collection"
-                group_keys.add(f"coll_{coll_name}")
-        elif scene.filter_light_types == 'KIND':
-            tmap = {'POINT': [], 'SPOT': [], 'SUN': [], 'AREA': []}
-            for obj in lights:
-                if obj.data.type in tmap:
-                    tmap[obj.data.type].append(obj)
-            for kind, items in tmap.items():
-                if items:
-                    group_keys.add(f"kind_{kind}")
-        elif scene.filter_light_types == 'GROUP':
-            for obj in lights:
-                group_name = getattr(obj, "custom_lightgroup", "")
-                if group_name:
-                    group_keys.add(f"group_{group_name}")
-        return list(group_keys)
-
-    def _get_group_objects(self, context, group_key):
-        scene = context.scene
-        filter_pattern = scene.light_editor_filter.lower()
-        if filter_pattern:
-            all_lights = [obj for obj in context.view_layer.objects
-                          if obj.type == 'LIGHT' and re.search(filter_pattern, obj.name, re.I)]
-                        #   if obj.type == 'LIGHT' and fnmatch.fnmatch(obj.name.lower(), filter_pattern)]
-        else:
-            all_lights = [obj for obj in context.view_layer.objects if obj.type == 'LIGHT']
-        if scene.filter_light_types == 'COLLECTION' and group_key.startswith("coll_"):
-            coll_name = group_key[5:]
-            return [obj for obj in all_lights
-                    if (obj.users_collection and obj.users_collection[0].name == coll_name)
-                    or (not obj.users_collection and coll_name == "No Collection")]
-        if scene.filter_light_types == 'KIND' and group_key.startswith("kind_"):
-            kind = group_key[5:]
-            return [obj for obj in all_lights if obj.data.type == kind]
-        if scene.filter_light_types == 'GROUP' and group_key.startswith("group_"):
-            group_name = group_key[6:]
-            return [obj for obj in all_lights if getattr(obj, "custom_lightgroup", "") == group_name]
-        return []
-
-
-
+    def execute(self, context):
+        context.scene.collapse_all_emissives = not context.scene.collapse_all_emissives
+        # Redraw the UI
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+        return {'FINISHED'}
+# --- End New Operator Classes ---
 
 class LIGHT_OT_ClearFilter(bpy.types.Operator):
-    """Clear Filter Types"""
     bl_idname = "le.clear_light_filter"
     bl_label = "Clear Filter"
-
     @classmethod
     def poll(cls, context):
         return context.scene.light_editor_filter
@@ -595,155 +701,375 @@ class LIGHT_OT_ClearFilter(bpy.types.Operator):
             context.scene.light_editor_filter = ""
         return {'FINISHED'}
 
-
 class LIGHT_OT_SelectLight(bpy.types.Operator):
-    """Selects light from UI and deselects everything else"""
     bl_idname = "le.select_light"
     bl_label = "Select Light"
-
-    name: bpy.props.StringProperty()  # Name of the light to select
+    name: bpy.props.StringProperty()
 
     def execute(self, context):
-        # Get the view layer objects
         vob = context.view_layer.objects
-
-        # Check if the light is already selected
         if self.name in vob:
             light = vob[self.name]
-            if light.select_get():  # If the light is already selected
-                # Deselect everything
+            if light.select_get():
                 bpy.ops.object.select_all(action='DESELECT')
                 self.report({'INFO'}, f"Deselected all objects")
             else:
-                # Deselect all objects first
                 bpy.ops.object.select_all(action='DESELECT')
-                # Select the specified light
                 light.select_set(True)
-                vob.active = light  # Set the light as the active object
+                vob.active = light
                 self.report({'INFO'}, f"Selected light: {self.name}")
         else:
             self.report({'ERROR'}, f"Light '{self.name}' not found")
-
         return {'FINISHED'}
 
-
-# -------------------------------------------------------------------------
-# 4) The main row UI: use custom_lightgroup property when in Light Group mode
-# -------------------------------------------------------------------------
 def draw_main_row(box, obj):
-    import bpy
     scene = bpy.context.scene
     light = obj.data
-
     row = box.row(align=True)
-    controls_row = row.row(align=True)
+    
+    # Auto-sync light.color and light.energy → emission node when enabling nodes
+    if light.use_nodes and light.node_tree and not hasattr(light, "_synced_once"):
+        output_node = next((n for n in light.node_tree.nodes if n.type == 'OUTPUT_LIGHT'), None)
+        has_emission = any(n.type == 'EMISSION' for n in light.node_tree.nodes)
+        if output_node and not has_emission:
+            # Clear and setup
+            nt = light.node_tree
+            nt.nodes.clear()
+            emission = nt.nodes.new("ShaderNodeEmission")
+            output = nt.nodes.new("ShaderNodeOutputLight")
+            emission.location = (0, 0)
+            output.location = (200, 0)
+            nt.links.new(emission.outputs["Emission"], output.inputs["Surface"])
 
-    # 1) On/Off toggle
+            # Copy values
+            emission.inputs["Color"].default_value = list(light.color) + [1.0]
+            emission.inputs["Strength"].default_value = light.energy
+
+            # Prevent redoing this forever
+            light["_synced_once"] = True
+
+    # Controls: toggle, solo, select, expand
+    controls_row = row.row(align=True)
     controls_row.prop(
         obj, "light_enabled", text="",
         icon="OUTLINER_OB_LIGHT" if obj.light_enabled else "LIGHT_DATA"
     )
     controls_row.active = obj.light_enabled
-
-    # 2) "Turn off others" toggle
     controls_row.prop(
         obj, "light_turn_off_others", text="",
         icon="RADIOBUT_ON" if obj.light_turn_off_others else "RADIOBUT_OFF"
     )
-
-    # 3) Selection button
     controls_row.operator(
         "le.select_light", text="",
-        icon="ORIENTATION_GLOBAL" if obj.select_get() else "LAYER_ACTIVE"
+        icon="RESTRICT_SELECT_ON" if obj.select_get() else "RESTRICT_SELECT_OFF"
     ).name = obj.name
+    controls_row.prop(
+        obj, "light_expanded", text="",
+        emboss=True,
+        icon='DOWNARROW_HLT' if obj.light_expanded else 'RIGHTARROW'
+    )
 
-    # -------------------------------------------------------
-    # Show the custom-lightgroup pulldown *only* if we're in "GROUP" mode;
-    # otherwise show the arrow for expanding light details.
-    # -------------------------------------------------------
-    if scene.filter_light_types == 'GROUP':
-        col_group = row.column(align=True)
-        col_group.scale_x = 0.6
-        col_group.prop(obj, "custom_lightgroup_menu", text="")
-    else:
-        controls_row.prop(
-            obj, "light_expanded", text="",
-            emboss=True,
-            icon='DOWNARROW_HLT' if obj.light_expanded else 'RIGHTARROW'
-        )
-
-    # 4) Light’s name
-    col_name = row.column(align=True)
-    col_name.scale_x = 0.5
+    # Light name
+    # Force row structure for clean alignment
+    col_name = row.row(align=True)
+    col_name.ui_units_x = 8
     col_name.prop(obj, "name", text="")
 
-    # In non‐Group modes, show color & energy inline
-    if scene.filter_light_types != 'GROUP':
-        col_color = row.column(align=True)
-        col_color.scale_x = 0.25
+    col_color = row.row(align=True)
+    col_color.ui_units_x = 4
+
+    col_energy = row.row(align=True)
+    col_energy.ui_units_x = 6
+
+    show_icon = False
+
+    # LIGHT COLOR
+    if light.use_nodes and light.node_tree:
+        nt = light.node_tree
+        output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_LIGHT'), None)
+        surface_input = output_node.inputs.get("Surface") if output_node else None
+
+        if surface_input and surface_input.is_linked:
+            from_node = surface_input.links[0].from_node
+            if from_node.type == 'EMISSION':
+                color_socket = from_node.inputs.get("Color")
+                strength_socket = from_node.inputs.get("Strength")
+
+                if color_socket:
+                    color_row = col_color.row(align=True)
+                    color_row.alignment = 'EXPAND'
+                    color_row.label(icon='NODETREE')
+                    color_row.enabled = False
+                    color_row.prop(color_socket, "default_value", text="")
+                else:
+                    col_color.label(text="")
+
+                if strength_socket:
+                    strength_row = col_energy.row(align=True)
+                    strength_row.alignment = 'EXPAND'
+                    strength_row.label(icon='NODETREE')
+                    strength_row.enabled = False
+                    strength_row.prop(strength_socket, "default_value", text="")
+                else:
+                    col_energy.label(text="")
+            else:
+                # Not connected to emission
+                col_color.label(icon='ERROR')
+                col_energy.label(icon='ERROR')
+        else:
+            col_color.prop(light, "color", text="")
+            col_energy.prop(light, "energy", text="")
+    else:
         col_color.prop(light, "color", text="")
-        col_energy = row.column(align=True)
-        col_energy.scale_x = 0.35
         col_energy.prop(light, "energy", text="")
 
-
-
-# class DataButtonsPanel:
-#     bl_space_type = 'PROPERTIES'
-#     bl_region_type = 'WINDOW'
-#     bl_context = "data"
-
-#     @classmethod
-#     def poll(cls, context):
-#         engine = context.engine
-#         return context.light and (engine in cls.COMPAT_ENGINES)
-
-# -------------------------------------------------------------------------
-# 5) The main panel
-# -------------------------------------------------------------------------
 class LIGHT_PT_editor(bpy.types.Panel):
-    """Panel to view/edit lights with grouping, filtering, and per‐group toggles."""
     bl_label = "Light Editor"
     bl_idname = "LIGHT_PT_editor"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Light Editor"
 
-    # Recursively draw collections and lights
-    def draw_layer_collection(self, layout, scene, layer_coll, all_lights, collection_path="", level=0):
-        import re
-        global group_checkbox_1_state, group_checkbox_2_state, group_collapse_dict
+    @classmethod
+    def poll(cls, context):
+        # Force redraw by checking material node tree updates
+        for mat in bpy.data.materials:
+            if mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.type in {'EMISSION', 'BSDF_PRINCIPLED'}:
+                        # Accessing properties to trigger dependency graph update
+                        if node.type == 'EMISSION' and node.inputs.get("Color"):
+                            _ = node.inputs["Color"].default_value # Access value
+                        elif node.type == 'BSDF_PRINCIPLED':
+                            # Check for 4.0+ names first
+                            emission_color_socket = node.inputs.get("Emission Color")
+                            if emission_color_socket:
+                                _ = emission_color_socket.default_value # Access value
+                            else:
+                                # Fallback to older name if present (though less likely to be the issue here)
+                                emission_color_socket_old = node.inputs.get("Emission")
+                                if emission_color_socket_old:
+                                    _ = emission_color_socket_old.default_value # Access value
+                            # Also access strength if present to ensure updates
+                            emission_strength_socket = node.inputs.get("Emission Strength")
+                            if emission_strength_socket:
+                                _ = emission_strength_socket.default_value # Access value
+        return True
 
-        # Build a unique path (e.g. "Master Collection/SubCollection/Foo")
-        # Starting path might be "", so handle that cleanly:
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        layout.row().prop(scene, "filter_light_types", expand=True)
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        row = layout.row(align=True)
+        row.prop(scene, "light_editor_filter", text="", icon="VIEWZOOM")
+        row.operator("le.clear_light_filter", text="", icon='PANEL_CLOSE')
+        if scene.filter_light_types == 'COLLECTION':
+            row = layout.row()
+            row.prop(scene, "selected_render_layer", text="Render Layer")
+        filter_str = scene.light_editor_filter.lower()
+        if filter_str:
+            lights = [
+                obj for obj in context.view_layer.objects
+                if obj.type == 'LIGHT' and re.search(filter_str, obj.name, re.I)
+            ]
+        else:
+            lights = [obj for obj in context.view_layer.objects if obj.type == 'LIGHT']
+
+        if scene.filter_light_types == 'COLLECTION':
+            self.draw_layer_collection(layout, scene, context.view_layer.layer_collection, lights)
+        elif scene.filter_light_types == 'KIND':
+            # --- Existing logic for grouping lights by type ---
+            groups = {'POINT': [], 'SPOT': [], 'SUN': [], 'AREA': []}
+            for obj in lights:
+                if obj.data.type in groups:
+                    groups[obj.data.type].append(obj)
+            # --- End existing light grouping logic ---
+
+            # --- Draw Light Groups (POINT, SPOT, SUN, AREA) ---
+            for kind in ('POINT', 'SPOT', 'SUN', 'AREA'):
+                if groups[kind]: # Only draw the section if there are lights of this kind
+                    group_key = f"kind_{kind}"
+                    collapsed = group_collapse_dict.get(group_key, False)
+                    header_box = layout.box()
+                    header_row = header_box.row(align=True)
+                    is_on_1 = group_checkbox_1_state.get(group_key, True)
+                    icon_1 = 'CHECKBOX_HLT' if is_on_1 else 'CHECKBOX_DEHLT'
+                    header_row.active = is_on_1
+                    op_1 = header_row.operator("light_editor.toggle_group_all_off",
+                                               text="",
+                                               icon=icon_1,
+                                               depress=is_on_1)
+                    op_1.group_key = group_key
+                    op_tri = header_row.operator("light_editor.toggle_group",
+                                                 text="",
+                                                 emboss=True,
+                                                 icon='RIGHTARROW' if collapsed else 'DOWNARROW_HLT')
+                    op_tri.group_key = group_key
+                    header_row.label(text=f"{kind} Lights", icon=f"LIGHT_{kind}")
+                    if not collapsed:
+                        for obj in groups[kind]:
+                            draw_main_row(header_box, obj)
+                            if obj.light_expanded:
+                                extra_box = header_box.box()
+                                draw_extra_params(self, extra_box, obj, obj.data)
+            # --- End Draw Light Groups ---
+
+            # --- Draw Emissive Materials Group ---
+            # Define a unique key for the Emissive Materials group
+            emissive_group_key = "kind_EMISSIVE"
+            emissive_collapsed = group_collapse_dict.get(emissive_group_key, False)
+
+            # Find emissive materials
+            emissive_pairs = find_emissive_objects(context)
+            # Only draw the Emissive section if there are emissive materials
+            if emissive_pairs:
+                emissive_header_box = layout.box()
+                emissive_header_row = emissive_header_box.row(align=True)
+
+                # Checkbox for Emissive Materials group
+                emissive_is_on = group_checkbox_1_state.get(emissive_group_key, True)
+                emissive_icon = 'CHECKBOX_HLT' if emissive_is_on else 'CHECKBOX_DEHLT'
+                emissive_header_row.active = emissive_is_on
+                emissive_op_1 = emissive_header_row.operator("light_editor.toggle_group_all_off",
+                                                   text="",
+                                                   icon=emissive_icon,
+                                                   depress=emissive_is_on)
+                emissive_op_1.group_key = emissive_group_key
+
+                # Triangle button for collapsing Emissive Materials group
+                emissive_op_tri = emissive_header_row.operator("light_editor.toggle_group",
+                                                     text="",
+                                                     emboss=True,
+                                                     icon='RIGHTARROW' if emissive_collapsed else 'DOWNARROW_HLT')
+                emissive_op_tri.group_key = emissive_group_key
+
+                # Label for Emissive Materials group
+                emissive_header_row.label(text="Emissive Materials", icon='SHADING_RENDERED')
+
+                # Draw the Emissive Materials list if not collapsed
+                if not emissive_collapsed:
+                    emissive_content_box = emissive_header_box.box()
+                    # Sort emissive materials
+                    sorted_emissives = sorted(emissive_pairs, key=lambda pair: f"{pair[0].name}_{pair[1].name}".lower())
+                    # Draw each emissive material row
+                    for obj, mat in sorted_emissives:
+                        draw_emissive_row(emissive_content_box, obj, mat)
+            
+        else: # NO_FILTER - "All" view
+            # --- "All Lights (Alphabetical)" Section with Kind/Collection style header ---
+            lights_header_box = layout.box()
+            lights_header_row = lights_header_box.row(align=True)
+
+            # Define a unique key for the "All Lights" group for checkbox state
+            all_lights_group_key = "all_lights_alpha"
+
+            # --- Checkbox for All Lights ---
+            is_on_1 = group_checkbox_1_state.get(all_lights_group_key, True)
+            icon_1 = 'CHECKBOX_HLT' if is_on_1 else 'CHECKBOX_DEHLT'
+            lights_header_row.active = is_on_1
+            op_1 = lights_header_row.operator("light_editor.toggle_group_all_off",
+                                               text="",
+                                               icon=icon_1,
+                                               depress=is_on_1)
+            op_1.group_key = all_lights_group_key
+            # --- End Checkbox ---
+
+            # --- Triangle for collapsing All Lights ---
+            is_lights_collapsed = group_collapse_dict.get(all_lights_group_key, False)
+            op_tri = lights_header_row.operator("light_editor.toggle_group",
+                                                 text="",
+                                                 emboss=True,
+                                                 icon='RIGHTARROW' if is_lights_collapsed else 'DOWNARROW_HLT')
+            op_tri.group_key = all_lights_group_key
+            # --- End Triangle ---
+
+            lights_header_row.label(text="All Lights (Alphabetical)", icon='LIGHT_DATA')
+
+            # Draw the lights list only if not collapsed
+            if not is_lights_collapsed:
+                lights_content_box = lights_header_box.box() # Optional sub-box for content
+                # Sort lights here
+                sorted_lights = sorted(lights, key=lambda o: o.name.lower())
+                # Handle checkbox logic for All Lights
+                if not is_on_1:
+                     # If checkbox is off, dim the content and don't draw individual rows normally
+                     # Or, apply the 'inactive' state. Let's just draw them normally but let the checkbox control the group's overall enable state visually.
+                     # The actual enable/disable logic for individual lights is handled by toggle_group_all_off.
+                     # For visual consistency, we can make the content box 'inactive' if the group is off.
+                     lights_content_box.enabled = False # This dims the whole content section
+
+                for obj in sorted_lights:
+                    # The individual light rows still manage their own enabled state via obj.light_enabled
+                    # The group checkbox state (is_on_1) is used for the header button and overall dimming
+                    draw_main_row(lights_content_box, obj)
+                    if obj.light_expanded:
+                        extra_box = lights_content_box.box()
+                        draw_extra_params(self, extra_box, obj, obj.data)
+            # --- End "All Lights (Alphabetical)" Section ---
+
+            # --- "All Emissive Materials (Alphabetical)" Section with Kind/Collection style header ---
+            emissive_header_box = layout.box()
+            emissive_header_row = emissive_header_box.row(align=True)
+
+            # Define a unique key for the "All Emissives" group for checkbox state
+            all_emissives_group_key = "all_emissives_alpha"
+
+            # --- Checkbox for All Emissives ---
+            is_on_2 = group_checkbox_1_state.get(all_emissives_group_key, True)
+            icon_2 = 'CHECKBOX_HLT' if is_on_2 else 'CHECKBOX_DEHLT'
+            emissive_header_row.active = is_on_2
+            op_2 = emissive_header_row.operator("light_editor.toggle_group_all_off",
+                                               text="",
+                                               icon=icon_2,
+                                               depress=is_on_2)
+            op_2.group_key = all_emissives_group_key
+            # --- End Checkbox ---
+
+            # --- Triangle for collapsing All Emissives ---
+            is_emissives_collapsed = group_collapse_dict.get(all_emissives_group_key, False)
+            op_tri2 = emissive_header_row.operator("light_editor.toggle_group",
+                                                 text="",
+                                                 emboss=True,
+                                                 icon='RIGHTARROW' if is_emissives_collapsed else 'DOWNARROW_HLT')
+            op_tri2.group_key = all_emissives_group_key
+            # --- End Triangle ---
+
+            emissive_header_row.label(text="All Emissive Materials (Alphabetical)", icon='SHADING_RENDERED')
+
+            if not is_emissives_collapsed:
+                emissive_content_box = emissive_header_box.box() # Optional sub-box for content
+
+                if not is_on_2:
+                    emissive_content_box.enabled = False
+
+                emissive_pairs = find_emissive_objects(context)
+                sorted_emissive_pairs = sorted(emissive_pairs, key=lambda pair: f"{pair[0].name}_{pair[1].name}".lower())
+
+                if not sorted_emissive_pairs:
+                     emissive_content_box.label(text="No emissive materials found.")
+                else:
+                    for obj, mat in sorted_emissive_pairs:
+                        draw_emissive_row(emissive_content_box, obj, mat)
+
+
+    def draw_layer_collection(self, layout, scene, layer_coll, all_lights, collection_path="", level=0):
+        global group_checkbox_1_state, group_collapse_dict
         this_coll_name = layer_coll.collection.name
         if collection_path:
-            # If we already have a path, append / + child name
             full_path = collection_path + "/" + this_coll_name
         else:
-            # If top-level, path = just the collection name
             full_path = this_coll_name
-
-        # Collect only the lights in this collection that pass the name filter
         lights_in_this_coll = [obj for obj in layer_coll.collection.objects if obj in all_lights]
-
-        # Check child sub-collections
         children = layer_coll.children
         has_sub = (len(children) > 0)
-
-        # If no lights here AND no children, skip drawing
         if not lights_in_this_coll and not has_sub:
             return
-
-        # Build a stable key for toggles/collapsing
         group_key = "coll_" + full_path
         collapsed = group_collapse_dict.get(group_key, False)
-
-        # Header box for this collection
         header_box = layout.box()
         header_row = header_box.row(align=True)
-
-        # (1) "All Off" checkbox
         is_on_1 = group_checkbox_1_state.get(group_key, True)
         icon_1 = 'CHECKBOX_HLT' if is_on_1 else 'CHECKBOX_DEHLT'
         header_row.active = is_on_1
@@ -752,36 +1078,18 @@ class LIGHT_PT_editor(bpy.types.Panel):
                                    icon=icon_1,
                                    depress=is_on_1)
         op_1.group_key = group_key
-
-        # (2) "Exclusive" radio
-        is_on_2 = group_checkbox_2_state.get(group_key, False)
-        icon_2 = 'RADIOBUT_ON' if is_on_2 else 'RADIOBUT_OFF'
-        op_2 = header_row.operator("light_editor.toggle_group_exclusive",
-                                   text="",
-                                   icon=icon_2,
-                                   depress=is_on_2)
-        op_2.group_key = group_key
-
-        # (3) Expand/collapse arrow
         op_tri = header_row.operator("light_editor.toggle_group",
                                      text="",
                                      emboss=True,
                                      icon='RIGHTARROW' if collapsed else 'DOWNARROW_HLT')
         op_tri.group_key = group_key
-
-        # Collection label
         header_row.label(text=this_coll_name, icon='OUTLINER_COLLECTION')
-
-        # If expanded, show lights + children
         if not collapsed:
-            # Draw each light row
             for obj in lights_in_this_coll:
                 draw_main_row(header_box, obj)
                 if obj.light_expanded:
                     extra_box = header_box.box()
                     draw_extra_params(self, extra_box, obj, obj.data)
-
-            # Recurse into sub-collections
             for child in children:
                 self.draw_layer_collection(
                     layout=header_box,
@@ -792,210 +1100,63 @@ class LIGHT_PT_editor(bpy.types.Panel):
                     level=level+1
                 )
 
-    def draw(self, context):
-        layout = self.layout
-        scene = context.scene
-                
-        layout.row().prop(scene, "filter_light_types", expand=True)
-        layout.use_property_split = True
-        layout.use_property_decorate = False  # No animation.
-
-        # Filter row
-        row = layout.row(align=True)
-        row.prop(scene, "light_editor_filter", text="", icon="VIEWZOOM")
-        row.operator("le.clear_light_filter", text="", icon='PANEL_CLOSE')
-        
-        if scene.filter_light_types == 'COLLECTION':
-            row = layout.row()
-            row.prop(scene, "selected_render_layer", text="Render Layer")
-
-        # Show add/delete group UI only if in Light Group mode
-        if scene.filter_light_types == 'GROUP':
-            row = layout.row(align=True)
-            row.prop(scene, "create_new_lightgroup", text="")
-            row.operator("light_editor.create_new_lightgroup", text="Add Lightgroup")
-
-            row = layout.row(align=True)
-            row.prop(scene, "light_editor_delete_group", text="")
-            row.operator("light_editor.delete_light_group", text="Delete Light Group")
-
-        # Figure out which lights pass our name filter
-        import re
-        filter_str = scene.light_editor_filter.lower()
-        if filter_str:
-            lights = [
-                obj for obj in context.view_layer.objects
-                if obj.type == 'LIGHT' and re.search(filter_str, obj.name, re.I)
-            ]
-        else:
-            lights = [obj for obj in context.view_layer.objects if obj.type == 'LIGHT']
-
-        # COLLECTION mode: show nested sub-collections
-        if scene.filter_light_types == 'COLLECTION':
-            self.draw_layer_collection(layout, scene, context.view_layer.layer_collection, lights)
-
-        elif scene.filter_light_types == 'KIND':
-            # Group by light type
-            groups = {'POINT': [], 'SPOT': [], 'SUN': [], 'AREA': []}
-            for obj in lights:
-                if obj.data.type in groups:
-                    groups[obj.data.type].append(obj)
-            for kind in ('POINT', 'SPOT', 'SUN', 'AREA'):
-                if groups[kind]:
-                    group_key = f"kind_{kind}"
-                    collapsed = group_collapse_dict.get(group_key, False)
-                    header_box = layout.box()
-                    header_row = header_box.row(align=True)
-
-                    is_on_1 = group_checkbox_1_state.get(group_key, True)
-                    icon_1 = 'CHECKBOX_HLT' if is_on_1 else 'CHECKBOX_DEHLT'
-                    header_row.active = is_on_1
-                    op_1 = header_row.operator("light_editor.toggle_group_all_off",
-                                               text="",
-                                               icon=icon_1,
-                                               depress=is_on_1)
-                    op_1.group_key = group_key
-
-                    is_on_2 = group_checkbox_2_state.get(group_key, False)
-                    icon_2 = 'RADIOBUT_ON' if is_on_2 else 'RADIOBUT_OFF'
-                    op_2 = header_row.operator("light_editor.toggle_group_exclusive",
-                                               text="",
-                                               icon=icon_2,
-                                               depress=is_on_2)
-                    op_2.group_key = group_key
-
-                    op_tri = header_row.operator("light_editor.toggle_group",
-                                                 text="",
-                                                 emboss=True,
-                                                 icon='RIGHTARROW' if collapsed else 'DOWNARROW_HLT')
-                    op_tri.group_key = group_key
-
-                    header_row.label(text=f"{kind} Lights", icon=f"LIGHT_{kind}")
-
-                    if not collapsed:
-                        for obj in groups[kind]:
-                            draw_main_row(header_box, obj)
-                            if obj.light_expanded:
-                                extra_box = header_box.box()
-                                draw_extra_params(self, extra_box, obj, obj.data)
-
-        elif scene.filter_light_types == 'GROUP':
-            groups = {}
-            for obj in lights:
-                grp = getattr(obj, "custom_lightgroup", "") or getattr(obj, "lightgroup", "") or "NoGroup"
-                groups.setdefault(grp, []).append(obj)
-            for grp_name, group_objs in groups.items():
-                group_key = f"group_{grp_name}"
-                collapsed = group_collapse_dict.get(group_key, False)
-                header_box = layout.box()
-                header_row = header_box.row(align=True)
-
-                is_on_1 = group_checkbox_1_state.get(group_key, True)
-                icon_1 = 'CHECKBOX_HLT' if is_on_1 else 'CHECKBOX_DEHLT'
-                header_row.active = is_on_1
-                op_1 = header_row.operator("light_editor.toggle_group_all_off",
-                                           text="",
-                                           icon=icon_1,
-                                           depress=is_on_1)
-                op_1.group_key = group_key
-
-                is_on_2 = group_checkbox_2_state.get(group_key, False)
-                icon_2 = 'RADIOBUT_ON' if is_on_2 else 'RADIOBUT_OFF'
-                op_2 = header_row.operator("light_editor.toggle_group_exclusive",
-                                           text="",
-                                           icon=icon_2,
-                                           depress=is_on_2)
-                op_2.group_key = group_key
-
-                op_tri = header_row.operator("light_editor.toggle_group",
-                                             text="",
-                                             emboss=True,
-                                             icon='RIGHTARROW' if collapsed else 'DOWNARROW_HLT')
-                op_tri.group_key = group_key
-
-                header_row.label(text=f"{grp_name}", icon='GROUP')
-
-                if not collapsed:
-                    for obj in group_objs:
-                        draw_main_row(header_box, obj)
-                        if obj.light_expanded:
-                            extra_box = header_box.box()
-                            draw_extra_params(self, extra_box, obj, obj.data)
-
-        else:
-            # NO_FILTER: Alphabetical
-            sorted_lights = sorted(lights, key=lambda o: o.name.lower())
-            box = layout.box()
-            box.label(text="All Lights (Alphabetical)", icon='LIGHT_DATA')
-            for obj in sorted_lights:
-                draw_main_row(box, obj)
-                if obj.light_expanded:
-                    extra_box = box.box()
-                    draw_extra_params(self, extra_box, obj, obj.data)
-
-
 @persistent
 def LE_check_lights_enabled(dummy):
     for obj in bpy.data.objects:
         if obj.type == 'LIGHT':
-            # print(obj.hide_viewport and obj.hide_render)
-            if (obj.hide_viewport and obj.hide_render):
+            if obj.hide_viewport and obj.hide_render:
                 bpy.context.view_layer.objects[obj.name].light_enabled = False
             else:
                 bpy.context.view_layer.objects[obj.name].light_enabled = True
 
-
 @persistent
 def LE_clear_handler(dummy):
     context = bpy.context
-    # Migration: for each light, if it has an old "lightgroup" attribute, migrate it.
-    if bpy and bpy.data:
-        # print(bpy)
-        # print(bpy.data)
-        for obj in bpy.data.objects:
-            if obj.type == 'LIGHT':
-                old_group = getattr(obj, "lightgroup", "")
-                if old_group:
-                    obj.custom_lightgroup = old_group
-                obj.custom_lightgroup_menu = obj.custom_lightgroup if obj.custom_lightgroup else "NoGroup"
+    for obj in bpy.data.objects:
+        if obj.type == 'LIGHT':
+            if obj.hide_viewport == False and obj.hide_render == False:
+                context.view_layer.objects[obj.name].light_enabled = True
+            else:
+                context.view_layer.objects[obj.name].light_enabled = False
 
-                # print(obj.name)
-                # Set enable correct
-                if (obj.hide_viewport == False and obj.hide_render == False):
-                    context.view_layer.objects[obj.name].light_enabled = True
-                else:
-                    context.view_layer.objects[obj.name].light_enabled = False
-            # self.hide_render = not self.light_enabled
-
-
-# Register the new operator and property
+# --- Add new operators to the classes tuple ---
 classes = (
     LIGHT_OT_ToggleGroup,
     LIGHT_OT_ToggleGroupAllOff,
-    LIGHT_OT_ToggleGroupExclusive,
-    LIGHT_OT_CreateNewLightgroup,
-    LIGHT_OT_DeleteLightGroup,
     LIGHT_OT_ClearFilter,
     LIGHT_OT_SelectLight,
     LIGHT_PT_editor,
+    LE_OT_isolate_emissive,
+    LE_OT_ToggleEmission,
+    LIGHT_OT_ToggleAllLights,   
+    LIGHT_OT_ToggleAllEmissives,
+    LIGHT_OT_ToggleAllLightsAlpha,    
+    LIGHT_OT_ToggleAllEmissivesAlpha,  
 )
 
 def register():
-    # Register scene properties
     bpy.types.Scene.current_active_light = bpy.props.PointerProperty(type=bpy.types.Object)
-    bpy.types.Scene.current_exclusive_group = bpy.props.StringProperty()
+    bpy.app.handlers.depsgraph_update_post.append(light_editor_tag_redraw)
     bpy.types.Scene.selected_render_layer = EnumProperty(
         name="Render Layer",
         description="Select the render layer",
-        items=get_render_layer_items,  # Your function that lists view layers.
+        items=get_render_layer_items,
         update=update_render_layer
     )
-    
-    # Register other classes and properties
+
+    bpy.types.Scene.collapse_all_lights = BoolProperty(
+        name="Collapse All Lights",
+        default=False,
+        description="Collapse the 'All Lights (Alphabetical)' section"
+    )
+    bpy.types.Scene.collapse_all_emissives = BoolProperty(
+        name="Collapse All Emissive Materials",
+        default=False, # Set to True if you want them collapsed by default
+        description="Collapse the 'All Emissive Materials (Alphabetical)' section"
+    )
+
     for cls in classes:
         bpy.utils.register_class(cls)
-
-    # Register other properties (as shown in your original code)
     bpy.types.Scene.light_editor_filter = StringProperty(
         name="Filter",
         default="",
@@ -1004,67 +1165,41 @@ def register():
     bpy.types.Scene.light_editor_kind_alpha = BoolProperty(
         name="By Kind",
         description="Group lights by kind",
-        default=False,  # Ensure this is False by default
+        default=False,
         update=update_group_by_kind
     )
     bpy.types.Scene.light_editor_group_by_collection = BoolProperty(
         name="By Collections",
         description="Group lights by collection",
-        default=False,  # Ensure this is False by default
+        default=False,
         update=update_group_by_collection
     )
-    bpy.types.Scene.light_editor_light_group = BoolProperty(
-        name="By Light Groups",
-        description="Group lights by their custom light group assignment",
-        default=False,  # Ensure this is False by default
-        update=update_light_group
-    )
-    bpy.types.Scene.create_new_lightgroup = StringProperty(
-        name="",
-        default="",
-        description="Enter a new light group name"
-    )
-    bpy.types.Scene.custom_lightgroups_list = StringProperty(
-        name="Custom Lightgroups",
-        default="",
-        description="Comma separated list of custom light groups created without an active light"
-    )
-    
-    bpy.types.Scene.light_editor_delete_group = EnumProperty(
-        name="Delete Light Group",
-        description="Select a light group to delete",
-        items=get_light_group_items  # Dynamically fetch light groups
-    )
-
     bpy.types.Scene.filter_light_types = EnumProperty(
         name="Type",
         description="Filter light by type",
-        items=(('NO_FILTER', 'All', 'Show All no filter (Alphabetical)', 'NONE', 0), ('KIND', 'Kind', 'FIlter lights by Kind', 'LIGHT_DATA', 1),('COLLECTION', 'Collection', 'FIlter lights by Collections', 'OUTLINER_COLLECTION', 2),('GROUP', 'Light Group', 'Filter lights by Groups', 'GROUP', 3)),
-        update=update_light_types
+        items=(
+            ('NO_FILTER', 'All', 'Show All no filter (Alphabetical)', 'NONE', 0),
+            ('KIND', 'Kind', 'Filter lights by Kind', 'LIGHT_DATA', 1),
+            ('COLLECTION', 'Collection', 'Filter lights by Collections', 'OUTLINER_COLLECTION', 2)
+        )
+    )
+    
+    bpy.types.Scene.collapse_all_lights_alpha = BoolProperty(
+    name="Collapse All Lights Alphabetical",
+    default=False,
+    description="Collapse the 'All Lights (Alphabetical)' section in the 'All' view"
+    )
+    bpy.types.Scene.collapse_all_emissives_alpha = BoolProperty(
+        name="Collapse All Emissive Materials Alphabetical",
+        default=False,
+        description="Collapse the 'All Emissive Materials (Alphabetical)' section in the 'All' view"
     )
 
-    # Register Light properties
     bpy.types.Light.soft_falloff = BoolProperty(default=False)
     bpy.types.Light.max_bounce = IntProperty(default=0, min=0, max=10)
     bpy.types.Light.multiple_instance = BoolProperty(default=False)
     bpy.types.Light.shadow_caustic = BoolProperty(default=False)
     bpy.types.Light.spread = FloatProperty(default=0.0, min=0.0, max=1.0)
-
-    
-    # Register custom properties on Object using unique names
-    bpy.types.Object.custom_lightgroup = StringProperty(
-        name="Light Group",
-        description="The custom lightgroup attribute for this object",
-        default=""
-    )
-    
-    bpy.types.Object.custom_lightgroup_menu = EnumProperty(
-        name="Light Group",
-        description="Select the custom light group for this light",
-        items=get_light_group_items,  # Dynamically fetch light groups
-        update=update_lightgroup_menu
-    )
-    
     bpy.types.Object.light_enabled = BoolProperty(
         name="Enabled",
         default=True,
@@ -1077,54 +1212,39 @@ def register():
     )
     bpy.types.Object.light_expanded = BoolProperty(
         name="Expanded",
-        default=False  
+        default=False
     )
-    
-    bpy.types.Scene.active_lightgroup_index = IntProperty(
-        name="Active Lightgroup Index",
-        description="Index of the currently active light group",
-        default=0,
-        min=0
-    )
-
-    #add handler post load > see @persistent
     bpy.app.handlers.load_post.append(LE_clear_handler)
-    # bpy.app.handlers.depsgraph_update_post.append(LE_check_lights_enabled)
     bpy.app.handlers.load_post.append(LE_check_lights_enabled)
-    
 
 def unregister():
-    #removove handler post load > see @persistent
     bpy.app.handlers.load_post.remove(LE_clear_handler)
     bpy.app.handlers.load_post.remove(LE_check_lights_enabled)
+    if light_editor_tag_redraw in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(light_editor_tag_redraw)
 
-    # Unregister scene properties
-    del bpy.types.Scene.current_active_light
-    del bpy.types.Scene.current_exclusive_group
-    del bpy.types.Scene.selected_render_layer
-    
-    # Unregister other classes and properties
+    # --- Unregister new properties ---
+    del bpy.types.Scene.collapse_all_lights
+    del bpy.types.Scene.collapse_all_emissives
+    # --- End Unregister new properties ---
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-
-    # Unregister other properties (as shown in your original code)
+    del bpy.types.Scene.current_active_light
+    del bpy.types.Scene.selected_render_layer
+    del bpy.types.Scene.collapse_all_lights_alpha
+    del bpy.types.Scene.collapse_all_emissives_alpha
     del bpy.types.Scene.light_editor_filter
     del bpy.types.Scene.light_editor_kind_alpha
     del bpy.types.Scene.light_editor_group_by_collection
-    del bpy.types.Scene.light_editor_light_group
-    del bpy.types.Scene.create_new_lightgroup
-    del bpy.types.Scene.custom_lightgroups_list
-    del bpy.types.Scene.light_editor_delete_group
     del bpy.types.Light.soft_falloff
     del bpy.types.Light.max_bounce
     del bpy.types.Light.multiple_instance
     del bpy.types.Light.shadow_caustic
     del bpy.types.Light.spread
-    del bpy.types.Object.custom_lightgroup
-    del bpy.types.Object.custom_lightgroup_menu
     del bpy.types.Object.light_enabled
     del bpy.types.Object.light_turn_off_others
     del bpy.types.Object.light_expanded
 
 if __name__ == "__main__":
     register()
+
