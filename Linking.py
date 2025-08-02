@@ -604,14 +604,14 @@ class LL_PT_Panel(bpy.types.Panel):
     bl_region_type = "UI"
     bl_category = "Light Editor"
     bl_options = {'DEFAULT_CLOSED'}
-    
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.render.engine == 'CYCLES'
+
     def draw(self, context):
         layout = self.layout
-        
-        # Check if the render engine is Eevee or EEVEEE
-        if context.scene.render.engine in {'BLENDER_EEVEE_NEXT'}:
-            layout.label(text="Light Linking is not supported in EEVEE", icon='ERROR')
-            return
+        scene = context.scene
 
         scene = context.scene
         main_row = layout.row(align=True)
@@ -666,7 +666,7 @@ def LL_clear_handler(dummy):
 # -------------------------------------------------------------------
 #   Registration
 # -------------------------------------------------------------------
-classes = (
+classes = [
     LL_LightItem,
     LL_MeshItem,
     LL_CollectionItem,
@@ -687,12 +687,14 @@ classes = (
     LL_UL_LightList_UI,
     LL_UL_MeshList_UI,
     LL_UL_CollectionList_UI,
-    LL_PT_Panel,
-)
+]
+
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    bpy.utils.register_class(LL_PT_Panel)
 
     bpy.types.Scene.ll_light_items = bpy.props.CollectionProperty(type=LL_LightItem)
     bpy.types.Scene.ll_mesh_items = bpy.props.CollectionProperty(type=LL_MeshItem)
@@ -711,6 +713,7 @@ def register():
 
     bpy.app.handlers.load_post.append(LL_clear_handler)
 
+
 def unregister():
     del bpy.types.Scene.ll_light_items
     del bpy.types.Scene.ll_mesh_items
@@ -720,10 +723,15 @@ def unregister():
     del bpy.types.Scene.ll_collection_index
     del bpy.types.Scene.ll_list_rows
 
+    bpy.utils.unregister_class(LL_PT_Panel)
+
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
     bpy.app.handlers.load_post.remove(LL_clear_handler)
+
+
+
 
 if __name__ == "__main__":
     register()

@@ -34,7 +34,8 @@ class LG_ClearFilter(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.scene.light_group_filter
+        return context.scene.render.engine == 'CYCLES'
+
 
     def execute(self, context):
         context.scene.light_group_filter = ""
@@ -206,15 +207,11 @@ class LG_PT_LightGroupPanel(Panel):
 
     @classmethod
     def poll(cls, context):
-        return True
+        return context.scene.render.engine == 'CYCLES'
 
     def draw(self, context):
         layout = self.layout
-
-        # Check if the render engine is Eevee
-        if context.scene.render.engine == 'BLENDER_EEVEE':
-            layout.label(text="Light Groups are not supported in EEVEE", icon='ERROR')
-            return
+        scene = context.scene
 
         # Existing UI code for other engines (e.g., Cycles)
         view_layer = context.view_layer
@@ -312,10 +309,10 @@ classes = (
     LG_AddLightGroup,
     LG_RemoveLightGroup,
     LG_ClearFilter,
-    LG_PT_LightGroupPanel,
 )
 
 def register():
+
     bpy.types.Scene.selected_render_layer = bpy.props.EnumProperty(
         name="Render Layer",
         description="Select the render layer",
@@ -339,6 +336,9 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    bpy.utils.register_class(LG_PT_LightGroupPanel)
+
+
 def unregister():
     del bpy.types.Scene.selected_render_layer
     del bpy.types.Scene.light_group_filter
@@ -348,6 +348,9 @@ def unregister():
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+
+    bpy.utils.unregister_class(LG_PT_LightGroupPanel)
+
 
 if __name__ == "__main__":
     register()
