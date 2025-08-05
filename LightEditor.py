@@ -933,26 +933,24 @@ class LE_OT_SelectEnvironment(bpy.types.Operator):
         return {'FINISHED'}
 
 class LE_OT_SelectGroup(bpy.types.Operator):
-    """Select objects within a group."""
+    """Select all objects in the specified group."""
     bl_idname = "le.select_group"
     bl_label = "Select Group"
     group_key: bpy.props.StringProperty()
 
     def execute(self, context):
         objects_to_select = []
-        objects_in_group = []  # Store all objects belonging to the group for selection check
-        deselect_all_flag = False  # Flag to indicate if we should deselect everything
-        # Get the filter string
+        objects_in_group = []
+        deselect_all_flag = False
         filter_str = context.scene.light_editor_filter.lower()
-        # Handle different group types - Determine objects belonging to the group
+
+        # Handle different group types
         if self.group_key.startswith("coll_"):
             coll_name = self.group_key[5:]
             if coll_name == "No Collection":
-                # Objects not in any collection (only in Scene Collection)
                 for obj in context.view_layer.objects:
-                    if obj.type == 'LIGHT' or (obj.type == 'MESH' and any(mat in [m for o, m in find_emissive_objects(context)] for mat in obj.material_slots)):
+                    if obj.type == 'LIGHT' or (obj.type == 'MESH' and any(mat in [m for o, m, n in find_emissive_objects(context)] for mat in obj.material_slots)):
                         objects_in_group.append(obj)
-                        # Check for specific group membership and apply filter
                         if len(obj.users_collection) == 1 and obj.users_collection[0].name == "Scene Collection":
                             if (not filter_str or re.search(filter_str, obj.name, re.I)) and (obj.type != 'LIGHT' or obj.light_enabled):
                                 objects_to_select.append(obj)
@@ -960,59 +958,78 @@ class LE_OT_SelectGroup(bpy.types.Operator):
                 collection = bpy.data.collections.get(coll_name)
                 if collection:
                     for obj in collection.all_objects:
-                        if obj.type == 'LIGHT' or (obj.type == 'MESH' and any(mat in [m for o, m in find_emissive_objects(context)] for mat in obj.material_slots)):
+                        if obj.type == 'LIGHT' or (obj.type == 'MESH' and any(mat in [m for o, m, n in find_emissive_objects(context)] for mat in obj.material_slots)):
                             objects_in_group.append(obj)
-                            # Apply filter and check light_enabled for lights
                             if (not filter_str or re.search(filter_str, obj.name, re.I)) and (obj.type != 'LIGHT' or obj.light_enabled):
                                 objects_to_select.append(obj)
         elif self.group_key.startswith("kind_"):
             kind = self.group_key[5:]
             if kind == "EMISSIVE":
-                # Emissive materials
-                for obj, mat in find_emissive_objects(context):
+                for obj, mat, node in find_emissive_objects(context):
                     if not filter_str or re.search(filter_str, obj.name, re.I) or re.search(filter_str, mat.name, re.I):
                         objects_in_group.append(obj)
                         objects_to_select.append(obj)
             else:
-                # Lights of a specific kind
                 for obj in context.view_layer.objects:
                     if obj.type == 'LIGHT' and obj.data.type == kind:
-                        if obj.light_enabled:  # Only include enabled lights in group
+                        if obj.light_enabled:
                             objects_in_group.append(obj)
                         if (not filter_str or re.search(filter_str, obj.name, re.I)) and obj.light_enabled:
                             objects_to_select.append(obj)
         elif self.group_key == "all_lights_alpha":
-            # All lights, respecting filter and light_enabled
             for obj in context.view_layer.objects:
-                if obj.type == 'LIGHT' and obj.light_enabled:  # Only include enabled lights
+                if obj.type == 'LIGHT' and obj.light_enabled:
                     objects_in_group.append(obj)
                     if not filter_str or re.search(filter_str, obj.name, re.I):
                         objects_to_select.append(obj)
         elif self.group_key == "all_emissives_alpha":
-            for obj, mat in find_emissive_objects(context):
+            for obj, mat, node in find_emissive_objects(context):
                 if not filter_str or re.search(filter_str, obj.name, re.I) or re.search(filter_str, mat.name, re.I):
                     objects_in_group.append(obj)
                     objects_to_select.append(obj)
+        elif self.group_key == "selected_lights":
+            for obj in context.view_layer.objects:
+                if obj.type == 'LIGHT' and obj.select_get() and obj.light_enabled:
+                    objects_in_group.append(obj)
+                    if not filter_str or re.search(filter_str, obj.name, re.I):
+                        objects_to_select.append(obj)
+        elif self.group_key == "selected_emissives":
+            for obj, mat, node in find_emissive_objects(context):
+                if obj.select_get():
+                    if not filter_str or re.search(filter_str, obj.name, re.I) or re.search(filter_str, mat.name, re.I):
+                        objects_in_group.append(obj)
+                        objects_to_select.append(obj)
+        elif self.group_key == "not_selected_lights":
+            for obj in context.view_layer.objects:
+                if obj.type == 'LIGHT' and not obj.select_get() and obj.light_enabled:
+                    objects_in_group.append(obj)
+                    if not filter_str or re.search(filter_str, obj.name, re.I):
+                        objects_to_select.append(obj)
+        elif self.group_key == "not_selected_emissives":
+            for obj, mat, node in find_emissive_objects(context):
+                if not obj.select_get():
+                    if not filter_str or re.search(filter_str, obj.name, re.I) or re.search(filter_str, mat.name, re.I):
+                        objects_in_group.append(obj)
+                        objects_to_select.append(obj)
         elif self.group_key == "env_header":
             self.report({'INFO'}, "Selected world: {}".format(context.scene.world.name))
             for area in context.screen.areas:
                 if area.type == 'NODE_EDITOR':
                     area.spaces.active.node_tree = context.scene.world.node_tree
             return {'FINISHED'}
+
         # --- Determine Action: Select or Deselect All ---
         selected_objects = [obj for obj in objects_in_group if obj.name in context.view_layer.objects and obj.select_get()]
         if objects_in_group and all(obj.select_get() for obj in objects_in_group if obj.name in context.view_layer.objects):
             deselect_all_flag = True
+
         # --- Perform Action ---
         any_selected = False
         if deselect_all_flag:
-            # --- Deselect All Objects in the View Layer ---
             bpy.ops.object.select_all(action='DESELECT')
-            self.report({'INFO'}, f"Deselected all objects.")
+            self.report({'INFO'}, f"Deselected all objects in group: {self.group_key}")
         else:
-            # --- Select Objects in Group (and deselect others) ---
             bpy.ops.object.select_all(action='DESELECT')
-            # Select the objects in the group
             for obj in objects_to_select:
                 if obj.name in context.view_layer.objects:
                     obj.select_set(True)
@@ -1023,12 +1040,14 @@ class LE_OT_SelectGroup(bpy.types.Operator):
                 self.report({'INFO'}, f"Selected {len(objects_to_select)} objects in group: {self.group_key}")
             else:
                 self.report({'INFO'}, f"No selectable objects found in group: {self.group_key}")
+
         # Redraw the UI to update icons
         for area in context.screen.areas:
-            if area.type in ('VIEW_3D', 'NODE_EDITOR'):
+            if area.type in ('VIEW_3D', 'NODE_EDITOR', 'PROPERTIES'):
                 area.tag_redraw()
-        return {'FINISHED'}
 
+        return {'FINISHED'}
+                        
 class LE_OT_ToggleEmission(bpy.types.Operator):
     bl_idname = "le.toggle_emission"
     bl_label = "Toggle Emission"
@@ -1290,16 +1309,15 @@ class EMISSIVE_OT_ToggleGroupAllOff(bpy.types.Operator):
         return {'FINISHED'}
     
 class LIGHT_OT_ToggleGroup(bpy.types.Operator):
-    """Toggle the collapse state of a group in the UI."""
+    """Toggle the collapse state of a group."""
     bl_idname = "light_editor.toggle_group"
-    bl_label = ""
+    bl_label = "Toggle Group"
     group_key: bpy.props.StringProperty()
 
     def execute(self, context):
-        current = group_collapse_dict.get(self.group_key, False)
-        group_collapse_dict[self.group_key] = not current
+        group_collapse_dict[self.group_key] = not group_collapse_dict.get(self.group_key, False)
         for area in context.screen.areas:
-            if area.type in {'VIEW_3D', 'PROPERTIES'}:  # Include PROPERTIES for Light Editor panel
+            if area.type in {'VIEW_3D', 'NODE_EDITOR', 'PROPERTIES'}:
                 area.tag_redraw()
         return {'FINISHED'}
 
@@ -2035,8 +2053,120 @@ class LIGHT_PT_editor(bpy.types.Panel):
                 return False
             return all(obj.select_get() for obj in objects if obj.name in context.view_layer.objects)
 
-        # Collection Mode
-        if scene.filter_light_types == 'COLLECTION':
+        # --- 5. Draw UI Based on Filter Type ---
+        if scene.filter_light_types == 'NO_FILTER':
+            ab = layout.box()
+            ar = ab.row(align=True)
+            key_a = "all_lights_alpha"
+            iA1 = 'CHECKBOX_HLT' if group_checkbox_1_state.get(key_a, True) else 'CHECKBOX_DEHLT'
+            oA1 = ar.operator("light_editor.toggle_kind", text="", icon=iA1, depress=group_checkbox_1_state.get(key_a, True))
+            oA1.group_key = key_a
+            oA2 = ar.operator("light_editor.toggle_group_exclusive", text="",
+                              icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_a, False) else 'RADIOBUT_OFF'),
+                              depress=group_checkbox_2_state.get(key_a, False))
+            oA2.group_key = key_a
+            select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_a, lights) else 'RESTRICT_SELECT_OFF'
+            op_select = ar.operator("le.select_group", text="", icon=select_icon)
+            op_select.group_key = key_a
+            oA3 = ar.operator("light_editor.toggle_group", text="",
+                              emboss=True,
+                              icon=('DOWNARROW_HLT' if not group_collapse_dict.get(key_a, False) else 'RIGHTARROW'))
+            oA3.group_key = key_a
+            ar.label(text="All Lights (Alphabetical)", icon='LIGHT_DATA')
+            if not group_collapse_dict.get(key_a, False):
+                lb6 = ab.box()
+                for o in sorted(lights, key=lambda x: x.name.lower()):
+                    draw_main_row(lb6, o)
+                    if o.light_expanded and not o.data.use_nodes:
+                        eb6 = lb6.box()
+                        draw_extra_params(self, eb6, o, o.data)
+            eb7 = layout.box()
+            er7 = eb7.row(align=True)
+            key_e = "all_emissives_alpha"
+            iem = 'CHECKBOX_HLT' if group_mat_checkbox_state.get(key_e, True) else 'CHECKBOX_DEHLT'
+            oE1 = er7.operator("light_editor.toggle_group_emissive_all_off", text="", icon=iem, depress=group_mat_checkbox_state.get(key_e, True))
+            oE1.group_key = key_e
+            oE2 = er7.operator("light_editor.isolate_group_emissive", text="",
+                               icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_e, False) else 'RADIOBUT_OFF'))
+            oE2.group_key = key_e
+            select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_e, [o for o, _, _ in filtered_emissive_pairs]) else 'RESTRICT_SELECT_OFF'
+            op_select = er7.operator("le.select_group", text="", icon=select_icon)
+            op_select.group_key = key_e
+            oE3 = er7.operator("light_editor.toggle_group", text="",
+                               emboss=True,
+                               icon=('DOWNARROW_HLT' if not group_collapse_dict.get(key_e, False) else 'RIGHTARROW'))
+            oE3.group_key = key_e
+            er7.label(text="All Emissive Materials (Alphabetical)", icon='SHADING_RENDERED')
+            if not group_collapse_dict.get(key_e, False):
+                cb7 = eb7.box()
+                grouped_emissives = group_emissive_by_material(filtered_emissive_pairs)
+                if not grouped_emissives:
+                    cb7.label(text="No emissive materials match filter", icon='INFO')
+                for obj, mat, nodes in sorted(grouped_emissives, key=lambda x: f"{x[0].name}_{x[1].name}".lower()):
+                    draw_emissive_row(cb7, obj, mat, nodes)
+            if scene.world:
+                draw_environment_single_row(layout.box(), context, filter_str)
+        elif scene.filter_light_types == 'KIND':
+            kinds = ['AREA', 'POINT', 'SPOT', 'SUN', 'EMISSIVE']
+            for kind in kinds:
+                if kind == 'EMISSIVE':
+                    key_k = f"kind_{kind}"
+                    collapsed = group_collapse_dict.get(key_k, False)
+                    emissives = [(o, m, n) for o, m, n in filtered_emissive_pairs]
+                    if emissives:
+                        eb = layout.box()
+                        er = eb.row(align=True)
+                        i_e = 'CHECKBOX_HLT' if group_mat_checkbox_state.get(key_k, True) else 'CHECKBOX_DEHLT'
+                        o_e1 = er.operator("light_editor.toggle_group_emissive_all_off", text="", icon=i_e, depress=group_mat_checkbox_state.get(key_k, True))
+                        o_e1.group_key = key_k
+                        o_e2 = er.operator("light_editor.isolate_group_emissive", text="",
+                                           icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_k, False) else 'RADIOBUT_OFF'))
+                        o_e2.group_key = key_k
+                        select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_k, [o for o, _, _ in emissives]) else 'RESTRICT_SELECT_OFF'
+                        op_select = er.operator("le.select_group", text="", icon=select_icon)
+                        op_select.group_key = key_k
+                        o_e3 = er.operator("light_editor.toggle_group", text="",
+                                           emboss=True,
+                                           icon=('DOWNARROW_HLT' if not collapsed else 'RIGHTARROW'))
+                        o_e3.group_key = key_k
+                        er.label(text="Emissive Materials", icon='SHADING_RENDERED')
+                        if not collapsed:
+                            cb = eb.box()
+                            grouped_emissives = group_emissive_by_material(emissives)
+                            if not grouped_emissives:
+                                cb.label(text="No emissive materials match filter", icon='INFO')
+                            for obj, mat, nodes in sorted(grouped_emissives, key=lambda x: f"{x[0].name}_{x[1].name}".lower()):
+                                draw_emissive_row(cb, obj, mat, nodes)
+                else:
+                    lights_in = [o for o in lights if o.data.type == kind]
+                    if lights_in:
+                        key_k = f"kind_{kind}"
+                        collapsed = group_collapse_dict.get(key_k, False)
+                        kb = layout.box()
+                        kr = kb.row(align=True)
+                        i_k = 'CHECKBOX_HLT' if group_checkbox_1_state.get(key_k, True) else 'CHECKBOX_DEHLT'
+                        o_k1 = kr.operator("light_editor.toggle_kind", text="", icon=i_k, depress=group_checkbox_1_state.get(key_k, True))
+                        o_k1.group_key = key_k
+                        o_k2 = kr.operator("light_editor.toggle_group_exclusive", text="",
+                                           icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_k, False) else 'RADIOBUT_OFF'),
+                                           depress=group_checkbox_2_state.get(key_k, False))
+                        o_k2.group_key = key_k
+                        select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_k, lights_in) else 'RESTRICT_SELECT_OFF'
+                        op_select = kr.operator("le.select_group", text="", icon=select_icon)
+                        op_select.group_key = key_k
+                        o_k3 = kr.operator("light_editor.toggle_group", text="",
+                                           emboss=True,
+                                           icon=('DOWNARROW_HLT' if not collapsed else 'RIGHTARROW'))
+                        o_k3.group_key = key_k
+                        kr.label(text=f"{kind.title()} Lights", icon='LIGHT_{}'.format(kind))
+                        if not collapsed:
+                            lb = kb.box()
+                            for o in sorted(lights_in, key=lambda x: x.name.lower()):
+                                draw_main_row(lb, o)
+                                if o.light_expanded and not o.data.use_nodes:
+                                    eb = lb.box()
+                                    draw_extra_params(self, eb, o, o.data)
+        elif scene.filter_light_types == 'COLLECTION':
             all_colls = []
             try:
                 gather_layer_collections(context.view_layer.layer_collection, all_colls)
@@ -2046,7 +2176,6 @@ class LIGHT_PT_editor(bpy.types.Panel):
                         any(o.type == 'LIGHT' or any(m in [mat for _, mat, _ in emissive_pairs] for m in o.material_slots) for o in lc.collection.all_objects)]
             no_lights = [o for o in lights if len(o.users_collection) == 1 and o.users_collection[0].name == "Scene Collection"]
             no_emissives = [o for o, _, _ in filtered_emissive_pairs if len(o.users_collection) == 1 and o.users_collection[0].name == "Scene Collection"]
-
             if not relevant and not no_lights and not no_emissives:
                 box = layout.box()
                 box.label(text="No Collections or Unassigned Lights/Emissives Found", icon='INFO')
@@ -2122,120 +2251,127 @@ class LIGHT_PT_editor(bpy.types.Panel):
                                 draw_extra_params(self, eb2, o, o.data)
                         if no_emissives:
                             cb2 = lb2.box()
-                            grouped_emissives = group_emissive_by_material(filtered_emissive_pairs)
+                            grouped_emissives = group_emissive_by_material(no_emissives)
                             for obj, mat, nodes in sorted(grouped_emissives, key=lambda x: f"{x[0].name}_{x[1].name}".lower()):
                                 draw_emissive_row(cb2, obj, mat, nodes)
-        elif scene.filter_light_types == 'KIND':
-            groups = {'POINT': [], 'SPOT': [], 'SUN': [], 'AREA': []}
-            for o in lights:
-                if o.data.type in groups:
-                    groups[o.data.type].append(o)
-            if any(groups.values()) or filtered_emissive_pairs:
-                for kind, objs in groups.items():
-                    if objs:
-                        key = f"kind_{kind}"
-                        collapsed_k = group_collapse_dict.get(key, False)
-                        kb = layout.box()
-                        kr = kb.row(align=True)
-                        i1 = 'CHECKBOX_HLT' if group_checkbox_1_state.get(key, True) else 'CHECKBOX_DEHLT'
-                        op_k1 = kr.operator("light_editor.toggle_kind", text="", icon=i1, depress=group_checkbox_1_state.get(key, True))
-                        op_k1.group_key = key
-                        op_k2 = kr.operator("light_editor.toggle_group_exclusive", text="",
-                                            icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key, False) else 'RADIOBUT_OFF'),
-                                            depress=group_checkbox_2_state.get(key, False))
-                        op_k2.group_key = key
-                        select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key, objs) else 'RESTRICT_SELECT_OFF'
-                        op_select = kr.operator("le.select_group", text="", icon=select_icon)
-                        op_select.group_key = key
-                        op_k3 = kr.operator("light_editor.toggle_group", text="",
-                                            emboss=True,
-                                            icon=('DOWNARROW_HLT' if not collapsed_k else 'RIGHTARROW'))
-                        op_k3.group_key = key
-                        kr.label(text=f"{kind} Lights", icon=f"LIGHT_{kind}")
-                        if not collapsed_k:
-                            lb4 = kb.box()
-                            for o in sorted(objs, key=lambda x: x.name.lower()):
-                                draw_main_row(lb4, o)
-                                if o.light_expanded and not o.data.use_nodes:
-                                    eb4 = lb4.box()
-                                    draw_extra_params(self, eb4, o, o.data)
-                ek3 = "kind_EMISSIVE"
-                collapsed_em = group_collapse_dict.get(ek3, False)
-                eb5 = layout.box()
-                er5 = eb5.row(align=True)
-                iem = 'CHECKBOX_HLT' if group_mat_checkbox_state.get(ek3, True) else 'CHECKBOX_DEHLT'
-                ot5 = er5.operator("light_editor.toggle_group_emissive_all_off", text="", icon=iem, depress=group_mat_checkbox_state.get(ek3, True))
-                ot5.group_key = ek3
-                oi5 = er5.operator("light_editor.isolate_group_emissive", text="",
-                                   icon=('RADIOBUT_ON' if group_checkbox_2_state.get(ek3, False) else 'RADIOBUT_OFF'))
-                oi5.group_key = ek3
-                select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(ek3, [o for o, _, _ in filtered_emissive_pairs]) else 'RESTRICT_SELECT_OFF'
-                op_select = er5.operator("le.select_group", text="", icon=select_icon)
-                op_select.group_key = ek3
-                oc5 = er5.operator("light_editor.toggle_group", text="",
-                                   emboss=True,
-                                   icon=('DOWNARROW_HLT' if not collapsed_em else 'RIGHTARROW'))
-                oc5.group_key = ek3
-                er5.label(text="Emissive Materials", icon='SHADING_RENDERED')
-                if not collapsed_em:
-                    cb5 = eb5.box()
-                    grouped_emissives = group_emissive_by_material(filtered_emissive_pairs)
+        elif scene.filter_light_types == 'SELECTED':
+            # Selected Lights
+            selected_lights = [o for o in lights if o.select_get()]
+            if selected_lights:
+                key_sl = "selected_lights"
+                collapsed_sl = group_collapse_dict.get(key_sl, False)
+                sb = layout.box()
+                sr = sb.row(align=True)
+                i_sl = 'CHECKBOX_HLT' if group_checkbox_1_state.get(key_sl, True) else 'CHECKBOX_DEHLT'
+                op_sl1 = sr.operator("light_editor.toggle_kind", text="", icon=i_sl, depress=group_checkbox_1_state.get(key_sl, True))
+                op_sl1.group_key = key_sl
+                op_sl2 = sr.operator("light_editor.toggle_group_exclusive", text="",
+                                     icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_sl, False) else 'RADIOBUT_OFF'),
+                                     depress=group_checkbox_2_state.get(key_sl, False))
+                op_sl2.group_key = key_sl
+                select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_sl, selected_lights) else 'RESTRICT_SELECT_OFF'
+                op_select = sr.operator("le.select_group", text="", icon=select_icon)
+                op_select.group_key = key_sl
+                op_sl3 = sr.operator("light_editor.toggle_group", text="",
+                                     emboss=True,
+                                     icon=('DOWNARROW_HLT' if not collapsed_sl else 'RIGHTARROW'))
+                op_sl3.group_key = key_sl
+                sr.label(text="Selected Lights", icon='LIGHT_DATA')
+                if not collapsed_sl:
+                    sb = sb.box()
+                    for o in sorted(selected_lights, key=lambda x: x.name.lower()):
+                        draw_main_row(sb, o)
+                        if o.light_expanded and not o.data.use_nodes:
+                            eb = sb.box()
+                            draw_extra_params(self, eb, o, o.data)
+            # Selected Emissive Meshes
+            selected_emissives = [(o, m, n) for o, m, n in filtered_emissive_pairs if o.select_get()]
+            if selected_emissives:
+                key_se = "selected_emissives"
+                collapsed_se = group_collapse_dict.get(key_se, False)
+                se_box = layout.box()
+                se_row = se_box.row(align=True)
+                i_se = 'CHECKBOX_HLT' if group_mat_checkbox_state.get(key_se, True) else 'CHECKBOX_DEHLT'
+                op_se1 = se_row.operator("light_editor.toggle_group_emissive_all_off", text="", icon=i_se, depress=group_mat_checkbox_state.get(key_se, True))
+                op_se1.group_key = key_se
+                op_se2 = se_row.operator("light_editor.isolate_group_emissive", text="",
+                                         icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_se, False) else 'RADIOBUT_OFF'),
+                                         depress=group_checkbox_2_state.get(key_se, False))
+                op_se2.group_key = key_se
+                select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_se, [o for o, _, _ in selected_emissives]) else 'RESTRICT_SELECT_OFF'
+                op_select = se_row.operator("le.select_group", text="", icon=select_icon)
+                op_select.group_key = key_se
+                op_se3 = se_row.operator("light_editor.toggle_group", text="",
+                                         emboss=True,
+                                         icon=('DOWNARROW_HLT' if not collapsed_se else 'RIGHTARROW'))
+                op_se3.group_key = key_se
+                se_row.label(text="Selected Emissive Meshes", icon='SHADING_RENDERED')
+                if not collapsed_se:
+                    se_cb = se_box.box()
+                    grouped_emissives = group_emissive_by_material(selected_emissives)
                     if not grouped_emissives:
-                        cb5.label(text="No emissive materials match filter", icon='INFO')
+                        se_cb.label(text="No selected emissive materials match filter", icon='INFO')
                     for obj, mat, nodes in sorted(grouped_emissives, key=lambda x: f"{x[0].name}_{x[1].name}".lower()):
-                        draw_emissive_row(cb5, obj, mat, nodes)
-                if scene.world:
-                    draw_environment_single_row(layout.box(), context, filter_str)
-        else:  # NO_FILTER mode
-            ab = layout.box()
-            ar = ab.row(align=True)
-            key_a = "all_lights_alpha"
-            iA1 = 'CHECKBOX_HLT' if group_checkbox_1_state.get(key_a, True) else 'CHECKBOX_DEHLT'
-            oA1 = ar.operator("light_editor.toggle_kind", text="", icon=iA1, depress=group_checkbox_1_state.get(key_a, True))
-            oA1.group_key = key_a
-            oA2 = ar.operator("light_editor.toggle_group_exclusive", text="",
-                              icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_a, False) else 'RADIOBUT_OFF'),
-                              depress=group_checkbox_2_state.get(key_a, False))
-            oA2.group_key = key_a
-            select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_a, lights) else 'RESTRICT_SELECT_OFF'
-            op_select = ar.operator("le.select_group", text="", icon=select_icon)
-            op_select.group_key = key_a
-            oA3 = ar.operator("light_editor.toggle_group", text="",
-                              emboss=True,
-                              icon=('DOWNARROW_HLT' if not group_collapse_dict.get(key_a, False) else 'RIGHTARROW'))
-            oA3.group_key = key_a
-            ar.label(text="All Lights (Alphabetical)", icon='LIGHT_DATA')
-            if not group_collapse_dict.get(key_a, False):
-                lb6 = ab.box()
-                for o in sorted(lights, key=lambda x: x.name.lower()):
-                    draw_main_row(lb6, o)
-                    if o.light_expanded and not o.data.use_nodes:
-                        eb6 = lb6.box()
-                        draw_extra_params(self, eb6, o, o.data)
-            eb7 = layout.box()
-            er7 = eb7.row(align=True)
-            key_e = "all_emissives_alpha"
-            iem = 'CHECKBOX_HLT' if group_mat_checkbox_state.get(key_e, True) else 'CHECKBOX_DEHLT'
-            oE1 = er7.operator("light_editor.toggle_group_emissive_all_off", text="", icon=iem, depress=group_mat_checkbox_state.get(key_e, True))
-            oE1.group_key = key_e
-            oE2 = er7.operator("light_editor.isolate_group_emissive", text="",
-                               icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_e, False) else 'RADIOBUT_OFF'))
-            oE2.group_key = key_e
-            select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_e, [o for o, _, _ in filtered_emissive_pairs]) else 'RESTRICT_SELECT_OFF'
-            op_select = er7.operator("le.select_group", text="", icon=select_icon)
-            op_select.group_key = key_e
-            oE3 = er7.operator("light_editor.toggle_group", text="",
-                               emboss=True,
-                               icon=('DOWNARROW_HLT' if not group_collapse_dict.get(key_e, False) else 'RIGHTARROW'))
-            oE3.group_key = key_e
-            er7.label(text="All Emissive Materials (Alphabetical)", icon='SHADING_RENDERED')
-            if not group_collapse_dict.get(key_e, False):
-                cb7 = eb7.box()
-                grouped_emissives = group_emissive_by_material(filtered_emissive_pairs)
-                if not grouped_emissives:
-                    cb7.label(text="No emissive materials match filter", icon='INFO')
-                for obj, mat, nodes in sorted(grouped_emissives, key=lambda x: f"{x[0].name}_{x[1].name}".lower()):
-                    draw_emissive_row(cb7, obj, mat, nodes)
+                        draw_emissive_row(se_cb, obj, mat, nodes)
+            # Not Selected Lights
+            not_selected_lights = [o for o in lights if not o.select_get()]
+            if not_selected_lights:
+                key_nsl = "not_selected_lights"
+                collapsed_nsl = group_collapse_dict.get(key_nsl, False)
+                nsl_box = layout.box()
+                nsl_row = nsl_box.row(align=True)
+                i_nsl = 'CHECKBOX_HLT' if group_checkbox_1_state.get(key_nsl, True) else 'CHECKBOX_DEHLT'
+                op_nsl1 = nsl_row.operator("light_editor.toggle_kind", text="", icon=i_nsl, depress=group_checkbox_1_state.get(key_nsl, True))
+                op_nsl1.group_key = key_nsl
+                op_nsl2 = nsl_row.operator("light_editor.toggle_group_exclusive", text="",
+                                           icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_nsl, False) else 'RADIOBUT_OFF'),
+                                           depress=group_checkbox_2_state.get(key_nsl, False))
+                op_nsl2.group_key = key_nsl
+                select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_nsl, not_selected_lights) else 'RESTRICT_SELECT_OFF'
+                op_select = nsl_row.operator("le.select_group", text="", icon=select_icon)
+                op_select.group_key = key_nsl
+                op_nsl3 = nsl_row.operator("light_editor.toggle_group", text="",
+                                           emboss=True,
+                                           icon=('DOWNARROW_HLT' if not collapsed_nsl else 'RIGHTARROW'))
+                op_nsl3.group_key = key_nsl
+                nsl_row.label(text="Not Selected Lights", icon='LIGHT_DATA')
+                if not collapsed_nsl:
+                    nslb = nsl_box.box()
+                    for o in sorted(not_selected_lights, key=lambda x: x.name.lower()):
+                        draw_main_row(nslb, o)
+                        if o.light_expanded and not o.data.use_nodes:
+                            eb = nslb.box()
+                            draw_extra_params(self, eb, o, o.data)
+            # Not Selected Emissive Meshes
+            not_selected_emissives = [(o, m, n) for o, m, n in filtered_emissive_pairs if not o.select_get()]
+            if not_selected_emissives:
+                key_nse = "not_selected_emissives"
+                collapsed_nse = group_collapse_dict.get(key_nse, False)
+                nse_box = layout.box()
+                nse_row = nse_box.row(align=True)
+                i_nse = 'CHECKBOX_HLT' if group_mat_checkbox_state.get(key_nse, True) else 'CHECKBOX_DEHLT'
+                op_nse1 = nse_row.operator("light_editor.toggle_group_emissive_all_off", text="", icon=i_nse, depress=group_mat_checkbox_state.get(key_nse, True))
+                op_nse1.group_key = key_nse
+                op_nse2 = nse_row.operator("light_editor.isolate_group_emissive", text="",
+                                           icon=('RADIOBUT_ON' if group_checkbox_2_state.get(key_nse, False) else 'RADIOBUT_OFF'),
+                                           depress=group_checkbox_2_state.get(key_nse, False))
+                op_nse2.group_key = key_nse
+                select_icon = 'RESTRICT_SELECT_ON' if is_group_selected(key_nse, [o for o, _, _ in not_selected_emissives]) else 'RESTRICT_SELECT_OFF'
+                op_select = nse_row.operator("le.select_group", text="", icon=select_icon)
+                op_select.group_key = key_nse
+                op_nse3 = nse_row.operator("light_editor.toggle_group", text="",
+                                           emboss=True,
+                                           icon=('DOWNARROW_HLT' if not collapsed_nse else 'RIGHTARROW'))
+                op_nse3.group_key = key_nse
+                nse_row.label(text="Not Selected Emissive Meshes", icon='SHADING_RENDERED')
+                if not collapsed_nse:
+                    nse_cb = nse_box.box()
+                    grouped_emissives = group_emissive_by_material(not_selected_emissives)
+                    if not grouped_emissives:
+                        nse_cb.label(text="No not selected emissive materials match filter", icon='INFO')
+                    for obj, mat, nodes in sorted(grouped_emissives, key=lambda x: f"{x[0].name}_{x[1].name}".lower()):
+                        draw_emissive_row(nse_cb, obj, mat, nodes)
+            # Environment
             if scene.world:
                 draw_environment_single_row(layout.box(), context, filter_str)
             
@@ -2452,8 +2588,9 @@ def register():
         name="Type",
         description="Filter light by type",
         items=(('NO_FILTER', 'All', 'Show All (Alphabetical)', 'NONE', 0),
-               ('KIND', 'Kind', 'Filter lights by Kind', 'LIGHT_DATA', 1),
-               ('COLLECTION', 'Collection', 'Filter lights by Collections', 'OUTLINER_COLLECTION', 2)),
+               ('SELECTED', 'Selected', 'Filter by selection status', 'RESTRICT_SELECT_OFF', 1),
+               ('KIND', 'Kind', 'Filter lights by Kind', 'LIGHT_DATA', 2),
+               ('COLLECTION', 'Collection', 'Filter lights by Collections', 'OUTLINER_COLLECTION', 3)),
         default='NO_FILTER'
     )
     bpy.types.Light.soft_falloff = BoolProperty(default=False)
