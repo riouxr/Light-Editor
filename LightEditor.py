@@ -2294,6 +2294,24 @@ def draw_environment_single_row(box, context, filter_str=""):
             row.prop(scene, "env_volume_label", text="")
 
 @persistent
+def LE_update_light_enabled_on_visibility_change(scene):
+    """Update light_enabled property when hide_viewport or hide_render changes."""
+    try:
+        context = bpy.context
+        for obj in context.scene.objects:
+            if obj.type == 'LIGHT' and obj.name in context.view_layer.objects:
+                # Consider the light disabled if either viewport or render is hidden
+                new_enabled = not (obj.hide_viewport or obj.hide_render)
+                if obj.light_enabled != new_enabled:
+                    obj.light_enabled = new_enabled
+                    # Redraw relevant UI areas
+                    for area in context.screen.areas:
+                        if area.type in {'VIEW_3D', 'PROPERTIES', 'NODE_EDITOR'}:
+                            area.tag_redraw()
+    except Exception as e:
+        pass
+        
+@persistent
 def LE_clear_emission_links(dummy):
     """Clear stale _emission_links data on scene load."""
     for mat in bpy.data.materials:
@@ -2364,15 +2382,21 @@ classes = (
 
 def register():
     """Register all classes and properties."""
+    # Register handlers
     bpy.app.handlers.depsgraph_update_post.append(LE_force_redraw_on_use_nodes_change)
-    # --- Register the new render layer property ---
+    bpy.app.handlers.load_post.append(LE_clear_handler)
+    bpy.app.handlers.load_post.append(LE_check_lights_enabled)
+    bpy.app.handlers.depsgraph_update_post.append(LE_clear_emissive_cache)
+    bpy.app.handlers.depsgraph_update_post.append(LE_update_light_enabled_on_visibility_change)
+
+    # Register the new render layer property
     bpy.types.Scene.light_editor_selected_render_layer = bpy.props.EnumProperty(
         name="Render Layer",
         description="Select the active render layer for the Light Editor",
         items=get_render_layer_items,
         update=update_render_layer,
     )
-    # After defining the property, set its initial value to the current view layer
+    # Set initial render layer
     def set_initial_render_layer(dummy):
         if hasattr(bpy.types.Scene, 'light_editor_selected_render_layer'):
             try:
@@ -2383,21 +2407,17 @@ def register():
                 pass
 
     bpy.app.handlers.load_post.append(set_initial_render_layer)
-    # Attempt to set initial value during registration if context is suitable
     try:
         set_initial_render_layer(None)
     except:
         pass
 
+    # Register properties and classes
     bpy.types.Scene.env_surface_label = bpy.props.StringProperty(default="Surface")
     bpy.types.Scene.env_volume_label = bpy.props.StringProperty(default="Volume")
-    bpy.types.Scene.env_surface_label = bpy.props.StringProperty(name="Surface", default="Surface")
-    bpy.types.Scene.env_volume_label = bpy.props.StringProperty(name="Volume", default="Volume")
     bpy.types.Scene.current_active_light = bpy.props.PointerProperty(type=bpy.types.Object)
     bpy.types.Scene.current_exclusive_group = bpy.props.StringProperty()
-    # The old selected_render_layer property is replaced by light_editor_selected_render_layer
-    # bpy.types.Scene.selected_render_layer = EnumProperty(...) # Removed/Replaced
-
+    
     for cls in classes:
         bpy.utils.register_class(cls)
 
@@ -2455,18 +2475,22 @@ def register():
         name="Expanded",
         default=False
     )
-    bpy.app.handlers.load_post.append(LE_clear_handler)
-    bpy.app.handlers.load_post.append(LE_check_lights_enabled)
-    bpy.app.handlers.depsgraph_update_post.append(LE_clear_emissive_cache)
-
 
 def unregister():
     """Unregister all classes and properties."""
-    # --- Unregister the new render layer property ---
-    if hasattr(bpy.types.Scene, 'light_editor_selected_render_layer'):
-        del bpy.types.Scene.light_editor_selected_render_layer
-
-    # Remove the load handler if it was added
+    # Remove handlers
+    if LE_update_light_enabled_on_visibility_change in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(LE_update_light_enabled_on_visibility_change)
+    if LE_force_redraw_on_use_nodes_change in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(LE_force_redraw_on_use_nodes_change)
+    if LE_clear_handler in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(LE_clear_handler)
+    if LE_check_lights_enabled in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(LE_check_lights_enabled)
+    if LE_clear_emissive_cache in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(LE_clear_emissive_cache)
+    
+    # Remove set_initial_render_layer handler
     def set_initial_render_layer(dummy):
         if hasattr(bpy.types.Scene, 'light_editor_selected_render_layer'):
             try:
@@ -2477,27 +2501,14 @@ def unregister():
                 pass
     if set_initial_render_layer in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(set_initial_render_layer)
-    # --- End unregister new property ---
 
-    if LE_force_redraw_on_use_nodes_change in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(LE_force_redraw_on_use_nodes_change)
-    if hasattr(bpy.types.Scene, "env_surface_label"):
-        del bpy.types.Scene.env_surface_label
-    if hasattr(bpy.types.Scene, "env_volume_label"):
-        del bpy.types.Scene.env_volume_label
+    # Unregister properties
+    if hasattr(bpy.types.Scene, 'light_editor_selected_render_layer'):
+        del bpy.types.Scene.light_editor_selected_render_layer
     if hasattr(bpy.types.Scene, 'env_surface_label'):
         del bpy.types.Scene.env_surface_label
     if hasattr(bpy.types.Scene, 'env_volume_label'):
         del bpy.types.Scene.env_volume_label
-    if LE_clear_emissive_cache in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(LE_clear_emissive_cache)
-    if LE_clear_handler in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(LE_clear_handler)
-    if LE_check_lights_enabled in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(LE_check_lights_enabled)
-    # The old selected_render_layer property removal
-    # if hasattr(bpy.types.Scene, 'selected_render_layer'): # Removed/Replaced
-    #     del bpy.types.Scene.selected_render_layer # Removed/Replaced
     if hasattr(bpy.types.Scene, 'current_active_light'):
         del bpy.types.Scene.current_active_light
     if hasattr(bpy.types.Scene, 'current_exclusive_group'):
@@ -2510,6 +2521,10 @@ def unregister():
         del bpy.types.Scene.light_editor_group_by_collection
     if hasattr(bpy.types.Scene, 'filter_light_types'):
         del bpy.types.Scene.filter_light_types
+    if hasattr(bpy.types.Scene, 'collapse_all_emissives'):
+        del bpy.types.Scene.collapse_all_emissives
+    if hasattr(bpy.types.Scene, 'collapse_all_emissives_alpha'):
+        del bpy.types.Scene.collapse_all_emissives_alpha
     if hasattr(bpy.types.Light, 'soft_falloff'):
         del bpy.types.Light.soft_falloff
     if hasattr(bpy.types.Light, 'max_bounce'):
@@ -2526,10 +2541,8 @@ def unregister():
         del bpy.types.Object.light_turn_off_others
     if hasattr(bpy.types.Object, 'light_expanded'):
         del bpy.types.Object.light_expanded
-    if hasattr(bpy.types.Scene, 'collapse_all_emissives'):
-        del bpy.types.Scene.collapse_all_emissives
-    if hasattr(bpy.types.Scene, 'collapse_all_emissives_alpha'):
-        del bpy.types.Scene.collapse_all_emissives_alpha
+
+    # Unregister classes
     for cls in reversed(classes):
         if hasattr(bpy.types, cls.__name__):
             bpy.utils.unregister_class(cls)
