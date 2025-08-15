@@ -1,10 +1,31 @@
+# LightGroup.py — Environment (World) visibility + selectable checkbox
+# This file reflects the previous patch (show World in group lists) and adds a checkbox
+# to select the Environment so it can be reassigned via Assign/Unassign like lights.
+
 import bpy
 from bpy.types import Operator, Panel
 from bpy.props import StringProperty
 
-# Global dictionaries for group states, moved to Scene for persistence
+# -------------------------------------------------------------------------
+# Scene-scoped state
+# -------------------------------------------------------------------------
+# Dictionaries for collapse and exclusivity (persist across redraws)
 bpy.types.Scene.group_collapse_dict = {}
 bpy.types.Scene.group_exclusive_dict = {}
+
+# -------------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------------
+def _get_world_if_lightgroup_capable(context):
+    """Return the scene World if it supports 'lightgroup' (Cycles), else None."""
+    world = context.scene.world
+    return world if (world and hasattr(world, "lightgroup")) else None
+
+def _display_name(obj):
+    """Nice label used in lists/filters."""
+    if isinstance(obj, bpy.types.World):
+        return f"{obj.name} (Environment)"
+    return obj.name
 
 # -------------------------------------------------------------------------
 # Render Layer Functions
@@ -18,7 +39,6 @@ def get_render_layer_items(self, context):
 
 def update_render_layer(self, context):
     selected = self.selected_render_layer
-    # Iterate over the scene’s view layers:
     for vl in context.scene.view_layers:
         if vl.name == selected:
             context.window.view_layer = vl
@@ -34,7 +54,7 @@ class LG_ClearFilter(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.scene.light_group_filter
+        return context.scene.render.engine == 'CYCLES'
 
     def execute(self, context):
         context.scene.light_group_filter = ""
@@ -44,7 +64,7 @@ class LG_ClearFilter(Operator):
 # Operators
 # -------------------------------------------------------------------------
 class LG_AssignLightGroup(Operator):
-    """Assign the selected light group to selected lights."""
+    """Assign the active light group to selected lights (and Environment if checked)."""
     bl_idname = "lg_editor.assign_light_group"
     bl_label = "Assign"
 
@@ -54,9 +74,16 @@ class LG_AssignLightGroup(Operator):
                 and view_layer.active_lightgroup_index >= 0
                 and view_layer.active_lightgroup_index < len(view_layer.lightgroups)):
             active_group = view_layer.lightgroups[view_layer.active_lightgroup_index]
+
+            # Selected LIGHT objects (selection driven by Object.is_selected -> select_set)
             selected_lights = [obj for obj in context.selected_objects if obj.type == 'LIGHT']
             for light in selected_lights:
                 light.lightgroup = active_group.name
+
+            # Environment (World) if user checked its checkbox
+            world = _get_world_if_lightgroup_capable(context)
+            if world and getattr(world, "le_is_selected", False):
+                world.lightgroup = active_group.name
 
             bpy.ops.lg_editor.reset_light_selection()
         else:
@@ -64,20 +91,26 @@ class LG_AssignLightGroup(Operator):
         return {'FINISHED'}
 
 class LG_UnassignLightGroup(Operator):
-    """Unassign the selected lights from their current light group."""
+    """Unassign selected lights (and Environment if checked) from any group."""
     bl_idname = "lg_editor.unassign_light_group"
     bl_label = "Unassign"
 
     def execute(self, context):
+        # Selected LIGHT objects
         selected_lights = [obj for obj in context.selected_objects if obj.type == 'LIGHT']
         for light in selected_lights:
             light.lightgroup = ""
+
+        # Environment (World) if user checked its checkbox
+        world = _get_world_if_lightgroup_capable(context)
+        if world and getattr(world, "le_is_selected", False):
+            world.lightgroup = ""
 
         bpy.ops.lg_editor.reset_light_selection()
         return {'FINISHED'}
 
 class LG_ResetLightSelection(Operator):
-    """Reset the selection of lights."""
+    """Reset the selection of lights and Environment checkbox."""
     bl_idname = "lg_editor.reset_light_selection"
     bl_label = "Reset Light Selection"
 
@@ -87,11 +120,15 @@ class LG_ResetLightSelection(Operator):
             if obj.type == 'LIGHT':
                 obj.is_selected = False
 
-        self.report({'INFO'}, "Deselected all lights")
+        world = _get_world_if_lightgroup_capable(context)
+        if world and hasattr(world, "le_is_selected"):
+            world.le_is_selected = False
+
+        self.report({'INFO'}, "Deselected all lights and Environment checkbox")
         return {'FINISHED'}
 
 class LG_ToggleLightSelection(Operator):
-    """Toggle selection for an individual light."""
+    """Toggle selection for an individual light object."""
     bl_idname = "lg_editor.toggle_light_selection"
     bl_label = "Toggle Light Selection"
 
@@ -106,7 +143,7 @@ class LG_ToggleLightSelection(Operator):
         return {'FINISHED'}
 
 class LG_ToggleGroupExclusive(Operator):
-    """Toggle exclusive activation of this group."""
+    """Toggle exclusive activation of this group (LIGHT objects only)."""
     bl_idname = "lg_editor.toggle_group_exclusive"
     bl_label = "Toggle Group Exclusive"
 
@@ -121,6 +158,7 @@ class LG_ToggleGroupExclusive(Operator):
             for obj in context.scene.objects:
                 if obj.type == 'LIGHT':
                     obj.hide_viewport = getattr(obj, "lightgroup", "") != exclusive_group_name
+            # World has no viewport toggle; leave it untouched.
         else:
             for obj in context.scene.objects:
                 if obj.type == 'LIGHT':
@@ -128,7 +166,7 @@ class LG_ToggleGroupExclusive(Operator):
         return {'FINISHED'}
 
 class LG_ToggleGroup(Operator):
-    """Toggle the collapse state of a group."""
+    """Toggle the collapse state of a group in the UI list."""
     bl_idname = "lg_editor.toggle_group"
     bl_label = "Toggle Group"
     group_key: bpy.props.StringProperty()
@@ -138,14 +176,14 @@ class LG_ToggleGroup(Operator):
         return {'FINISHED'}
 
 class LG_AddLightGroup(Operator):
-    """Add a new light group in the current view_layer."""
+    """Add a new light group in the current view layer."""
     bl_idname = "lg_editor.add_light_group"
     bl_label = "Add Light Group"
 
     def execute(self, context):
         view_layer = context.view_layer
         if not hasattr(view_layer, "lightgroups"):
-            self.report({'WARNING'}, "This Blender version doesn't support per‐view‐layer lightgroups.")
+            self.report({'WARNING'}, "This Blender version doesn't support per-view-layer lightgroups.")
             return {'CANCELLED'}
 
         new_group = view_layer.lightgroups.add()
@@ -154,7 +192,7 @@ class LG_AddLightGroup(Operator):
         return {'FINISHED'}
 
 class LG_RemoveLightGroup(Operator):
-    """Remove the selected light group."""
+    """Remove the selected light group and clear assignments on its lights."""
     bl_idname = "lg_editor.remove_light_group"
     bl_label = "Remove Light Group"
 
@@ -164,15 +202,14 @@ class LG_RemoveLightGroup(Operator):
             if view_layer.active_lightgroup_index >= 0 and view_layer.active_lightgroup_index < len(view_layer.lightgroups):
                 active_group_name = view_layer.lightgroups[view_layer.active_lightgroup_index].name
 
-                # Unassign lights from the group before removing the group
+                # Unassign lights from the group before removing
                 for obj in context.scene.objects:
                     if obj.type == 'LIGHT' and getattr(obj, "lightgroup", "") == active_group_name:
                         obj.lightgroup = ""
 
-                # Use the Blender operator to remove the lightgroup
+                # Note: We don't touch World.lightgroup here; Blender will handle invalid refs.
                 bpy.ops.scene.view_layer_remove_lightgroup()
 
-                # Adjust group index if necessary
                 if view_layer.active_lightgroup_index >= len(view_layer.lightgroups):
                     view_layer.active_lightgroup_index = max(0, len(view_layer.lightgroups) - 1)
 
@@ -189,10 +226,25 @@ class LG_RemoveLightGroup(Operator):
             self.report({'WARNING'}, "Lightgroups not available in this Blender version.")
         return {'FINISHED'}
 
+# -------------------------------------------------------------------------
+# Drawing
+# -------------------------------------------------------------------------
 def draw_main_row(box, obj):
+    """Draw a row for either a LIGHT object or the Environment (World).
+    - LIGHT: checkbox toggles Object.is_selected (also viewport selection)
+    - WORLD: checkbox toggles World.le_is_selected (for Assign/Unassign)
+    """
     row = box.row(align=True)
-    row.prop(obj, "is_selected", text="", emboss=True, icon='NONE')
-    row.prop(obj, "name", text="")
+
+    if isinstance(obj, bpy.types.World):
+        # Selectable Environment checkbox (doesn't affect viewport selection)
+        sel = row.row(align=True)
+        sel.prop(obj, "le_is_selected", text="", emboss=True, icon='NONE')
+        row.label(text=_display_name(obj), icon='WORLD')
+    else:
+        # LIGHT object row (kept minimal per previous version)
+        row.prop(obj, "is_selected", text="", emboss=True, icon='NONE')
+        row.label(text=obj.name, icon='LIGHT')
 
 # -------------------------------------------------------------------------
 # Main Panel
@@ -206,19 +258,14 @@ class LG_PT_LightGroupPanel(Panel):
 
     @classmethod
     def poll(cls, context):
-        return True
+        return context.scene.render.engine == 'CYCLES'
 
     def draw(self, context):
         layout = self.layout
-
-        # Check if the render engine is Eevee
-        if context.scene.render.engine == 'BLENDER_EEVEE':
-            layout.label(text="Light Groups are not supported in EEVEE", icon='ERROR')
-            return
-
-        # Existing UI code for other engines (e.g., Cycles)
+        scene = context.scene
         view_layer = context.view_layer
 
+        # Lightgroup list / add / remove
         row = layout.row(align=True)
         col = row.column()
         if hasattr(view_layer, "lightgroups"):
@@ -230,55 +277,68 @@ class LG_PT_LightGroupPanel(Panel):
         else:
             col.label(text="No Lightgroups in this Blender version", icon='ERROR')
 
+        # Assign / Unassign / Reset (lights + Environment checkbox)
         row = layout.row(align=True)
         row.operator("lg_editor.assign_light_group", text="Assign")
         row.operator("lg_editor.unassign_light_group", text="Unassign")
         row.operator("lg_editor.reset_light_selection", text="Deselect All")
 
-        # Add the filter row
+        # Filter
         row = layout.row(align=True)
-        row.prop(context.scene, "light_group_filter", text="", icon="VIEWZOOM")
+        row.prop(scene, "light_group_filter", text="", icon="VIEWZOOM")
         row.operator("lg_editor.clear_filter", text="", icon='PANEL_CLOSE')
 
-        # Add the render layer dropdown
+        # Render layer dropdown
         row = layout.row()
-        row.prop(context.scene, "selected_render_layer", text="Render Layer")
+        row.prop(scene, "selected_render_layer", text="Render Layer")
 
+        # -----------------------------------------------------------------
+        # Build grouped lists (include Environment/World where relevant)
+        # -----------------------------------------------------------------
         groups = {}
+        capable_world = _get_world_if_lightgroup_capable(context)
+
         if hasattr(view_layer, "lightgroups"):
             for lg in view_layer.lightgroups:
                 lights_in_group = [
-                    obj for obj in context.scene.objects
+                    obj for obj in scene.objects
                     if obj.type == 'LIGHT'
-                        and not obj.hide_render
-                        and getattr(obj, "lightgroup", "") == lg.name
+                    and not obj.hide_render
+                    and getattr(obj, "lightgroup", "") == lg.name
                 ]
+                # Include the World if it's assigned to this group
+                if capable_world and getattr(capable_world, "lightgroup", "") == lg.name:
+                    lights_in_group.append(capable_world)
                 groups[lg.name] = lights_in_group
 
+        # Not Assigned
         not_assigned = [
-            obj for obj in context.scene.objects
+            obj for obj in scene.objects
             if obj.type == 'LIGHT'
-               and not obj.hide_render
-               and not getattr(obj, "lightgroup", "")
+            and not obj.hide_render
+            and not getattr(obj, "lightgroup", "")
         ]
+        if capable_world and not getattr(capable_world, "lightgroup", ""):
+            not_assigned.append(capable_world)
         if not_assigned:
             groups["Not Assigned"] = not_assigned
 
-        # Filter groups based on the filter text
-        filter_pattern = context.scene.light_group_filter.lower()
+        # Filter groups
+        filter_pattern = scene.light_group_filter.strip().lower()
         filtered_groups = {}
         for grp_name, group_objs in groups.items():
             if filter_pattern:
-                filtered_objs = [obj for obj in group_objs if filter_pattern in obj.name.lower()]
+                filtered_objs = [obj for obj in group_objs if filter_pattern in _display_name(obj).lower()]
                 if filtered_objs:
                     filtered_groups[grp_name] = filtered_objs
             else:
                 filtered_groups[grp_name] = group_objs
 
+        # Draw
         for grp_name, group_objs in filtered_groups.items():
             group_key = f"group_{grp_name}"
-            collapsed = context.scene.group_collapse_dict.get(group_key, False)
-            is_exclusive = context.scene.group_exclusive_dict.get(group_key, False)
+            collapsed = scene.group_collapse_dict.get(group_key, False)
+            is_exclusive = scene.group_exclusive_dict.get(group_key, False)
 
             header_box = layout.box()
             header_row = header_box.row(align=True)
@@ -298,7 +358,6 @@ class LG_PT_LightGroupPanel(Panel):
                 for obj in group_objs:
                     draw_main_row(header_box, obj)
 
-
 # -------------------------------------------------------------------------
 # Classes and Registration
 # -------------------------------------------------------------------------
@@ -312,10 +371,10 @@ classes = (
     LG_AddLightGroup,
     LG_RemoveLightGroup,
     LG_ClearFilter,
-    LG_PT_LightGroupPanel,
 )
 
 def register():
+    # Scene properties
     bpy.types.Scene.selected_render_layer = bpy.props.EnumProperty(
         name="Render Layer",
         description="Select the render layer",
@@ -329,6 +388,7 @@ def register():
         description="Filter light groups by name (wildcards allowed)"
     )
 
+    # Object selection checkbox (mirrors viewport selection)
     bpy.types.Object.is_selected = bpy.props.BoolProperty(
         name="Is Selected",
         description="Indicates whether the light is selected",
@@ -336,18 +396,34 @@ def register():
         update=lambda self, context: self.select_set(self.is_selected)
     )
 
+    # Environment selection checkbox for assignment/unassignment
+    bpy.types.World.le_is_selected = bpy.props.BoolProperty(
+        name="Selected (Light Groups)",
+        description="Select the Environment to Assign/Unassign its light group",
+        default=False
+    )
+
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    bpy.utils.register_class(LG_PT_LightGroupPanel)
+
+
 def unregister():
+    # Remove props
     del bpy.types.Scene.selected_render_layer
     del bpy.types.Scene.light_group_filter
     del bpy.types.Object.is_selected
+    if hasattr(bpy.types.World, "le_is_selected"):
+        del bpy.types.World.le_is_selected
     del bpy.types.Scene.group_collapse_dict
     del bpy.types.Scene.group_exclusive_dict
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+
+    bpy.utils.unregister_class(LG_PT_LightGroupPanel)
+
 
 if __name__ == "__main__":
     register()
