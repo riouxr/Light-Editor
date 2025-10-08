@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "LightEditor"
-version = "2.3.0"
+version = "2.4.0"
 name = "Light Editor"
 tagline = "Adds buttons to quickly switch between mesh display types"
 maintainer = "Blender Bob"

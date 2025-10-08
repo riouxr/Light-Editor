@@ -412,6 +412,28 @@ def get_all_collections(obj):
             all_collections.add(" > ".join(path))
     return sorted(all_collections)
 
+def is_emissive_node_active(node):
+    if node.type == 'EMISSION':
+        strength_socket = node.inputs.get("Strength")
+        color_socket = node.inputs.get("Color")
+    elif node.type == 'BSDF_PRINCIPLED':
+        strength_socket = node.inputs.get("Emission Strength")
+        color_socket = node.inputs.get("Emission Color")
+    else:
+        return False
+
+    if not strength_socket or not color_socket:
+        return False
+
+    # If either socket is linked, assume potentially active
+    if strength_socket.is_linked or color_socket.is_linked:
+        return True
+
+    # If not linked, check values
+    strength = strength_socket.default_value
+    color = color_socket.default_value[:3]  # RGB
+    return strength > 0 and any(c > 0 for c in color)
+
 def find_emissive_objects(context, search_objects=None):
     """Find all objects with emissive materials, including all reachable emissive nodes."""
     global emissive_material_cache
@@ -456,7 +478,8 @@ def find_emissive_objects(context, search_objects=None):
             for link in output_node.inputs['Surface'].links:
                 find_emission_nodes(link.from_node, set(), found_nodes)
             for node in found_nodes:
-                emissive_objs.append((obj, mat, node))
+                if is_emissive_node_active(node):
+                    emissive_objs.append((obj, mat, node))
 
     if use_cache:
         if not emissive_objs:
