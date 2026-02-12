@@ -1,3 +1,13 @@
+bl_info = {
+    "name": "Light Group Editor",
+    "author": "Robert Rioux",
+    "version": (1, 0, 1),  # Incremented version
+    "blender": (4, 0, 0),
+    "location": "View3D > Sidebar > Light Editor",
+    "description": "Manage Cycles Light Groups with environment support",
+    "category": "Lighting",
+}
+
 # LightGroup.py — Environment (World) visibility + selectable checkbox
 # This file reflects the previous patch (show World in group lists) and adds a checkbox
 # to select the Environment so it can be reassigned via Assign/Unassign like lights.
