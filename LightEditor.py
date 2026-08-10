@@ -389,6 +389,33 @@ def get_all_collections(obj):
             all_collections.add(" > ".join(path))
     return sorted(all_collections)
 
+def is_emissive_node_active(node):
+    """True only if the node actually emits light.
+
+    Every Principled BSDF carries an "Emission Strength" socket, so node type
+    alone would mark every ordinary material as emissive. Strength 0 or a black
+    colour means no contribution and must not be listed.
+    """
+    if node.type == 'EMISSION':
+        strength_socket = node.inputs.get("Strength")
+        color_socket = node.inputs.get("Color")
+    elif node.type == 'BSDF_PRINCIPLED':
+        strength_socket = node.inputs.get("Emission Strength")
+        color_socket = node.inputs.get("Emission Color")
+    else:
+        return False
+
+    if not strength_socket or not color_socket:
+        return False
+
+    # A driven or linked socket can be anything at render time; assume active.
+    if strength_socket.is_linked or color_socket.is_linked:
+        return True
+
+    strength = strength_socket.default_value
+    color = color_socket.default_value[:3]  # RGB
+    return strength > 0 and any(c > 0 for c in color)
+
 def find_emissive_objects(context, search_objects=None):
     """Find all objects with emissive materials, including all reachable emissive nodes."""
     global emissive_material_cache
@@ -433,7 +460,8 @@ def find_emissive_objects(context, search_objects=None):
             for link in output_node.inputs['Surface'].links:
                 find_emission_nodes(link.from_node, set(), found_nodes)
             for node in found_nodes:
-                emissive_objs.append((obj, mat, node))
+                if is_emissive_node_active(node):
+                    emissive_objs.append((obj, mat, node))
 
     if use_cache:
         if not emissive_objs:
@@ -827,37 +855,6 @@ class LE_OT_ToggleEnvironment(bpy.types.Operator):
                 area.tag_redraw()
         return {'FINISHED'}
 
-def execute(self, context):
-    global isolate_env_header_state, isolate_env_surface_state, isolate_env_volume_state
-    global env_isolated_ui_state  # ← ADD THIS
-
-    flag_map = {
-        "HEADER": "isolate_env_header_state",
-        "SURFACE": "isolate_env_surface_state",
-        "VOLUME": "isolate_env_volume_state",
-    }
-    mode_map = {
-        "HEADER": UnifiedIsolateMode.ENVIRONMENT,
-        "SURFACE": UnifiedIsolateMode.ENVIRONMENT_SURFACE,
-        "VOLUME": UnifiedIsolateMode.ENVIRONMENT_VOLUME,
-    }
-
-    unified_mode = mode_map.get(self.mode, UnifiedIsolateMode.ENVIRONMENT)
-    is_currently_active = _unified_isolate_manager.is_active(unified_mode)
-
-    if not is_currently_active:
-        globals()[flag_map[self.mode]] = True
-        if self.mode == "HEADER":
-            env_isolated_ui_state = True  # ← SET TRUE when activated
-        _unified_isolate_manager.activate(context, unified_mode)
-    else:
-        globals()[flag_map[self.mode]] = False
-        if self.mode == "HEADER":
-            env_isolated_ui_state = False  # ← SET FALSE when deactivated
-        _unified_isolate_manager.deactivate(context)
-
-    return {'FINISHED'}
-
 class LE_OT_SelectEnvironment(bpy.types.Operator):
     """Select the environment world in the Shader Editor."""
     bl_idname = "le.select_environment"
@@ -1083,33 +1080,7 @@ class LE_OT_ToggleEmission(bpy.types.Operator):
             if area.type in {'VIEW_3D', 'NODE_EDITOR', 'PROPERTIES'}:
                 area.tag_redraw()
         return {'FINISHED'}
-    
-def _disable_material_node(self, mat, node):
-    global _emissive_link_backup
-    if not node or not mat.use_nodes:
-        return
-    nt = mat.node_tree
 
-    strength = node.inputs.get("Strength") if node.type == 'EMISSION' else node.inputs.get("Emission Strength")
-    color = node.inputs.get("Color") if node.type == 'EMISSION' else node.inputs.get("Emission Color")
-    socket = strength or color
-    if not socket:
-        return
-
-    key = f"{mat.name}:{node.name}:{socket.name}"
-
-    if socket.is_linked and socket.links:
-        link = socket.links[0]
-        _emissive_link_backup[key] = ('LINK', node.name, socket.name, link.from_node.name, link.from_socket.name)
-        nt.links.remove(link)
-    else:
-        if socket.name == "Color":
-            _emissive_link_backup[key] = ('VALUE', node.name, socket.name, tuple(socket.default_value[:]))
-            socket.default_value = (0, 0, 0, 1)
-        else:
-            _emissive_link_backup[key] = ('VALUE', node.name, socket.name, socket.default_value)
-            socket.default_value = 0
-    
 class LE_OT_isolate_emissive(bpy.types.Operator):
     """Toggle isolation of emissive nodes—or entire material if node_name == ""."""
     bl_idname = "le.isolate_emissive"
