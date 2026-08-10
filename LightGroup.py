@@ -17,6 +17,11 @@ from bpy.types import Operator, Panel
 from bpy.props import StringProperty
 from bpy.app.handlers import persistent
 
+# Single source of truth for "does this node actually emit light", shared with
+# the Light Editor panel so both lists agree. Safe at import time: __init__.py
+# imports LightEditor first and LightEditor never imports this module.
+from .LightEditor import is_emissive_node_active
+
 # -------------------------------------------------------------------------
 # Scene-scoped state
 # -------------------------------------------------------------------------
@@ -43,6 +48,59 @@ def _display_name(obj):
         return f"{obj.name} (Environment)"
     return obj.name
 
+# Emissive lookup is per-material and runs during panel draw, so the result is
+# cached and invalidated from a depsgraph handler (see LG_clear_emissive_cache).
+_emissive_material_cache = {}
+
+def _material_is_emissive(mat):
+    """True if the material's active output is fed by an Emission/Principled emission node."""
+    # use_nodes is deprecated and slated for removal in Blender 6.0; default it
+    # to True so this keeps working once the property is gone.
+    if not mat or not getattr(mat, "use_nodes", True) or not mat.node_tree:
+        return False
+
+    cached = _emissive_material_cache.get(mat.name)
+    if cached is not None:
+        return cached
+
+    result = False
+    nt = mat.node_tree
+    output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+    surface = output_node.inputs.get('Surface') if output_node else None
+    if surface and surface.is_linked:
+        visited = set()
+        stack = [link.from_node for link in surface.links]
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            # Node type alone isn't enough: every Principled BSDF has an
+            # emission socket, so an unfiltered check lists the whole scene.
+            if is_emissive_node_active(node):
+                result = True
+                break
+            for socket in node.inputs:
+                if socket.is_linked:
+                    stack.extend(link.from_node for link in socket.links)
+
+    _emissive_material_cache[mat.name] = result
+    return result
+
+def _is_emissive_mesh(obj):
+    """True for a mesh object carrying at least one emissive material."""
+    if obj.type != 'MESH':
+        return False
+    return any(_material_is_emissive(slot.material) for slot in obj.material_slots)
+
+def _is_lightgroup_object(obj):
+    """Objects that Cycles can assign to a light group: lights and emissive meshes."""
+    return obj.type == 'LIGHT' or _is_emissive_mesh(obj)
+
+def _lightgroup_objects(scene):
+    """All light-group-capable objects in the scene."""
+    return [obj for obj in scene.objects if _is_lightgroup_object(obj)]
+
 def _is_selected(obj):
     """Selection state of an object, safe to call from a draw function.
 
@@ -54,6 +112,23 @@ def _is_selected(obj):
     except RuntimeError:
         return False
 
+def LG_clear_emissive_cache(scene, depsgraph=None):
+    """Drop the emissive lookup when a material changes.
+
+    Without this the panel would keep listing a mesh after its emission node
+    was removed, and miss one that just gained it. Only Material updates matter
+    — the cache is keyed by material, and which materials an object uses is
+    re-read on every lookup — so object transforms leave it intact rather than
+    forcing a full node-tree rescan on every viewport move.
+    """
+    if depsgraph is None:
+        _emissive_material_cache.clear()
+        return
+    for update in depsgraph.updates:
+        if isinstance(update.id, bpy.types.Material):
+            _emissive_material_cache.clear()
+            return
+
 @persistent
 def LG_clear_state_on_load(dummy):
     """Drop solo state on file load.
@@ -62,6 +137,7 @@ def LG_clear_state_on_load(dummy):
     so carrying them into a freshly loaded file would leave the UI claiming a
     group is soloed while the backup refers to objects from the old scene.
     """
+    _emissive_material_cache.clear()
     _exclusive_visibility_backup.clear()
     if hasattr(bpy.types.Scene, "group_exclusive_dict"):
         bpy.types.Scene.group_exclusive_dict.clear()
@@ -116,8 +192,9 @@ class LG_AssignLightGroup(Operator):
                 and view_layer.active_lightgroup_index < len(view_layer.lightgroups)):
             active_group = view_layer.lightgroups[view_layer.active_lightgroup_index]
 
-            # Selected LIGHT objects (selection driven by Object.is_selected -> select_set)
-            selected_lights = [obj for obj in context.selected_objects if obj.type == 'LIGHT']
+            # Selected lights and emissive meshes (selection driven by
+            # Object.is_selected -> select_set)
+            selected_lights = [obj for obj in context.selected_objects if _is_lightgroup_object(obj)]
             for light in selected_lights:
                 light.lightgroup = active_group.name
 
@@ -137,8 +214,8 @@ class LG_UnassignLightGroup(Operator):
     bl_label = "Unassign"
 
     def execute(self, context):
-        # Selected LIGHT objects
-        selected_lights = [obj for obj in context.selected_objects if obj.type == 'LIGHT']
+        # Selected lights and emissive meshes
+        selected_lights = [obj for obj in context.selected_objects if _is_lightgroup_object(obj)]
         for light in selected_lights:
             light.lightgroup = ""
 
@@ -157,9 +234,8 @@ class LG_ResetLightSelection(Operator):
 
     def execute(self, context):
         bpy.ops.object.select_all(action='DESELECT')
-        for obj in context.scene.objects:
-            if obj.type == 'LIGHT':
-                obj.is_selected = False
+        for obj in _lightgroup_objects(context.scene):
+            obj.is_selected = False
 
         world = _get_world_if_lightgroup_capable(context)
         if world and hasattr(world, "le_is_selected"):
@@ -213,29 +289,28 @@ class LG_ToggleGroupExclusive(Operator):
             # (already hidden) state as if it were the user's own.
             if not was_soloing:
                 _exclusive_visibility_backup.clear()
-                for obj in context.scene.objects:
-                    if obj.type == 'LIGHT':
-                        _exclusive_visibility_backup[obj.name] = (
-                            obj.hide_viewport, obj.hide_render
-                        )
+                for obj in _lightgroup_objects(context.scene):
+                    _exclusive_visibility_backup[obj.name] = (
+                        obj.hide_viewport, obj.hide_render
+                    )
 
             exclusive_dict[self.group_key] = True
             exclusive_group_name = self.group_key.replace("group_", "")
-            for obj in context.scene.objects:
-                if obj.type == 'LIGHT':
-                    hidden = getattr(obj, "lightgroup", "") != exclusive_group_name
-                    obj.hide_viewport = hidden
-                    obj.hide_render = hidden
+            for obj in _lightgroup_objects(context.scene):
+                hidden = getattr(obj, "lightgroup", "") != exclusive_group_name
+                obj.hide_viewport = hidden
+                obj.hide_render = hidden
             # World has no viewport toggle; leave it untouched.
         else:
             # Restore what the user had before soloing rather than forcing
             # everything visible (which wiped their own hidden lights).
-            for obj in context.scene.objects:
-                if obj.type != 'LIGHT':
-                    continue
-                vp, rp = _exclusive_visibility_backup.get(obj.name, (False, False))
-                obj.hide_viewport = vp
-                obj.hide_render = rp
+            # Iterate the backup, not the scene: a mesh whose emission was
+            # edited away while soloed still needs its visibility restored.
+            for name, (vp, rp) in _exclusive_visibility_backup.items():
+                obj = context.scene.objects.get(name)
+                if obj:
+                    obj.hide_viewport = vp
+                    obj.hide_render = rp
             _exclusive_visibility_backup.clear()
 
         for area in context.screen.areas:
@@ -280,9 +355,9 @@ class LG_RemoveLightGroup(Operator):
             if view_layer.active_lightgroup_index >= 0 and view_layer.active_lightgroup_index < len(view_layer.lightgroups):
                 active_group_name = view_layer.lightgroups[view_layer.active_lightgroup_index].name
 
-                # Unassign lights from the group before removing
-                for obj in context.scene.objects:
-                    if obj.type == 'LIGHT' and getattr(obj, "lightgroup", "") == active_group_name:
+                # Unassign lights and emissive meshes from the group before removing
+                for obj in _lightgroup_objects(context.scene):
+                    if getattr(obj, "lightgroup", "") == active_group_name:
                         obj.lightgroup = ""
 
                 # Note: We don't touch World.lightgroup here; Blender will handle invalid refs.
@@ -308,8 +383,8 @@ class LG_RemoveLightGroup(Operator):
 # Drawing
 # -------------------------------------------------------------------------
 def draw_main_row(box, obj):
-    """Draw a row for either a LIGHT object or the Environment (World).
-    - LIGHT: toggles viewport selection
+    """Draw a row for a LIGHT object, an emissive mesh, or the Environment (World).
+    - LIGHT / emissive mesh: toggles viewport selection
     - WORLD: toggles World.le_is_selected (for Assign/Unassign)
 
     Both use the same select-cursor icon as the Light Editor panel — a
@@ -332,7 +407,8 @@ def draw_main_row(box, obj):
                           icon='RESTRICT_SELECT_ON' if selected else 'RESTRICT_SELECT_OFF',
                           depress=selected)
         op.light_name = obj.name
-        row.label(text=obj.name, icon='LIGHT')
+        # Same icon the Light Editor panel uses for emissive meshes.
+        row.label(text=obj.name, icon='LIGHT' if obj.type == 'LIGHT' else 'SHADING_RENDERED')
 
 # -------------------------------------------------------------------------
 # Main Panel
@@ -386,6 +462,10 @@ class LG_PT_LightGroupPanel(Panel):
         groups = {}
         capable_world = _get_world_if_lightgroup_capable(context)
 
+        # Resolved once per draw: emissive detection walks node trees, so
+        # re-scanning the scene for every light group would cost real time.
+        candidates = _lightgroup_objects(scene)
+
         if hasattr(view_layer, "lightgroups"):
             for lg in view_layer.lightgroups:
                 # Membership is about light group assignment, not visibility.
@@ -393,9 +473,8 @@ class LG_PT_LightGroupPanel(Panel):
                 # list whenever anything hid them (solo/exclusive, the Light
                 # Editor's enable toggle, or a manual outliner click).
                 lights_in_group = [
-                    obj for obj in scene.objects
-                    if obj.type == 'LIGHT'
-                    and getattr(obj, "lightgroup", "") == lg.name
+                    obj for obj in candidates
+                    if getattr(obj, "lightgroup", "") == lg.name
                 ]
                 # Include the World if it's assigned to this group
                 if capable_world and getattr(capable_world, "lightgroup", "") == lg.name:
@@ -403,11 +482,7 @@ class LG_PT_LightGroupPanel(Panel):
                 groups[lg.name] = lights_in_group
 
         # Not Assigned
-        not_assigned = [
-            obj for obj in scene.objects
-            if obj.type == 'LIGHT'
-            and not getattr(obj, "lightgroup", "")
-        ]
+        not_assigned = [obj for obj in candidates if not getattr(obj, "lightgroup", "")]
         if capable_world and not getattr(capable_world, "lightgroup", ""):
             not_assigned.append(capable_world)
         if not_assigned:
@@ -504,12 +579,17 @@ def register():
 
     if LG_clear_state_on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(LG_clear_state_on_load)
+    if LG_clear_emissive_cache not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(LG_clear_emissive_cache)
 
 
 def unregister():
     if LG_clear_state_on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(LG_clear_state_on_load)
+    if LG_clear_emissive_cache in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(LG_clear_emissive_cache)
 
+    _emissive_material_cache.clear()
     _exclusive_visibility_backup.clear()
 
     # Remove props. Each removal is guarded so that one failure can't abort the
