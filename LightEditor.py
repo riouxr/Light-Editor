@@ -42,6 +42,20 @@ def is_blender_4_5_or_higher():
     """Check if the Blender version is 4.5 or higher."""
     return bpy.app.version >= (4, 5, 0)
 
+def get_emission_strength_socket(node):
+    """Return a shader node's emission strength socket, or None if it has none.
+
+    Matching on socket name alone is not safe. Bump and Normal Map nodes also
+    have a socket called "Strength", so a name-only lookup picked those up and
+    soloing zeroed the user's bump and normal settings (issue #15). Only
+    Emission and Principled BSDF nodes carry an emission strength.
+    """
+    if node.type == 'EMISSION':
+        return node.inputs.get("Strength")
+    if node.type == 'BSDF_PRINCIPLED':
+        return node.inputs.get("Emission Strength")
+    return None
+
 # --- New Unified Isolate System ---
 
 class UnifiedOnOffManager:
@@ -77,8 +91,9 @@ class UnifiedOnOffManager:
             if not mat.use_nodes:
                 continue
             for node in mat.node_tree.nodes:
-                # catch both pure Emission nodes and Principled BSDF emission sockets
-                strength_socket = node.inputs.get("Strength") or node.inputs.get("Emission Strength")
+                # Only Emission / Principled emission sockets, never Bump or
+                # Normal Map, which also have a socket called "Strength".
+                strength_socket = get_emission_strength_socket(node)
                 if not strength_socket:
                     continue
 
@@ -125,7 +140,7 @@ class UnifiedOnOffManager:
             node = mat.node_tree.nodes.get(node_name)
             if not node:
                 continue
-            strength_socket = node.inputs.get("Strength") or node.inputs.get("Emission Strength")
+            strength_socket = get_emission_strength_socket(node)
             if strength_socket:
                 strength_socket.default_value = val
 
@@ -191,7 +206,7 @@ class UnifiedIsolateManager:
                 self._backup[obj.name] = (obj.hide_viewport, obj.hide_render)
         for obj, mat, node in find_emissive_objects(context):
             key = (mat.name, node.name)
-            s = node.inputs.get("Strength") if node.type == 'EMISSION' else node.inputs.get("Emission Strength")
+            s = get_emission_strength_socket(node)
             if s:
                 self._backup[key] = s.default_value
         world = context.scene.world
@@ -219,7 +234,7 @@ class UnifiedIsolateManager:
             _, node_name = identifier if identifier else (None, None)
             for obj, mat, node in find_emissive_objects(context):
                 if (mat.name, node.name) == identifier:
-                    s = node.inputs.get("Strength") if node.type == 'EMISSION' else node.inputs.get("Emission Strength")
+                    s = get_emission_strength_socket(node)
                     if s:
                         s.default_value = self._backup[(mat.name, node.name)]
         elif mode == UnifiedIsolateMode.ENVIRONMENT:
@@ -248,7 +263,7 @@ class UnifiedIsolateManager:
                 if mat and mat.use_nodes:
                     node = mat.node_tree.nodes.get(node_name)
                     if node:
-                        s = node.inputs.get("Strength") if node.type == 'EMISSION' else node.inputs.get("Emission Strength")
+                        s = get_emission_strength_socket(node)
                         if s:
                             s.default_value = val
             elif key.startswith("env_link_"):  # Environment links
@@ -269,6 +284,14 @@ class UnifiedIsolateManager:
                 if obj and obj.type == 'LIGHT':
                     obj.hide_viewport, obj.hide_render = val
                     obj.light_enabled = not (val[0] and val[1])
+
+        # force_all_off() changes more than this manager's own backup covers: it
+        # sweeps every material in the file, while the backup above only holds
+        # the emissive nodes reachable from the view layer. Without this the
+        # difference was never put back. It runs last deliberately — it holds the
+        # real light_enabled value, which the loop above can only guess at from
+        # the hide flags.
+        _unified_on_off_manager.restore_all()
 
         self._backup.clear()
         self._active_mode = None
@@ -528,9 +551,9 @@ def draw_emissive_row(box, obj, mat, emissive_nodes):
 
     # --- Toggle & Isolate (header) ---
     enabled = any(
-        (n.inputs.get("Strength") or n.inputs.get("Emission Strength")).default_value > 0 or
-        (n.inputs.get("Strength") or n.inputs.get("Emission Strength")).is_linked
-        for n in emissive_nodes
+        sock.default_value > 0 or sock.is_linked
+        for sock in (get_emission_strength_socket(n) for n in emissive_nodes)
+        if sock
     )
     icon = 'OUTLINER_OB_LIGHT' if enabled else 'LIGHT_DATA'
     op_toggle = row.operator("le.toggle_emission", text="", icon=icon, depress=enabled)
@@ -556,7 +579,7 @@ def draw_emissive_row(box, obj, mat, emissive_nodes):
 
     # Determine if single-node linked case
     color_input    = first_node.inputs.get("Color") if first_node.type == 'EMISSION' else first_node.inputs.get("Emission Color")
-    strength_input = first_node.inputs.get("Strength") if first_node.type == 'EMISSION' else first_node.inputs.get("Emission Strength")
+    strength_input = get_emission_strength_socket(first_node)
     linked_case = (not multiple_nodes) and ((color_input and color_input.is_linked) or (strength_input and strength_input.is_linked))
 
     # --- Header columns: equal for multi-node or linked single-node ---
@@ -610,7 +633,7 @@ def draw_emissive_row(box, obj, mat, emissive_nodes):
             sub_row = sub_box.row(align=True)
             sub_row.label(text="", icon='BLANK1')
 
-            s_in = subnode.inputs.get("Strength") if subnode.type == 'EMISSION' else subnode.inputs.get("Emission Strength")
+            s_in = get_emission_strength_socket(subnode)
             val = s_in.default_value if s_in else 0.0
             ico = 'OUTLINER_OB_LIGHT' if (s_in and (s_in.is_linked or val > 0)) else 'LIGHT_DATA'
             op_n = sub_row.operator("le.toggle_emission", text="", icon=ico, depress=(val > 0))
@@ -1018,14 +1041,14 @@ class LE_OT_ToggleEmission(bpy.types.Operator):
             if not node:
                 self.report({'WARNING'}, f"Node {self.node_name} not found in material {self.mat_name}")
                 return {'CANCELLED'}
+            if not get_emission_strength_socket(node):
+                self.report({'WARNING'},
+                            f"Node {self.node_name} in {self.mat_name} is not an emissive node")
+                return {'CANCELLED'}
             nodes_to_toggle = [node]
         else:
             # Main row: toggle all emissive nodes
-            nodes_to_toggle = [
-                n for n in nt.nodes
-                if n.type in {'EMISSION', 'BSDF_PRINCIPLED'}
-                and (n.inputs.get("Strength") or n.inputs.get("Emission Strength"))
-            ]
+            nodes_to_toggle = [n for n in nt.nodes if get_emission_strength_socket(n)]
             if not nodes_to_toggle:
                 self.report({'WARNING'}, f"No emissive nodes found in material {self.mat_name}")
                 return {'CANCELLED'}
@@ -1037,13 +1060,13 @@ class LE_OT_ToggleEmission(bpy.types.Operator):
 
         # Check if material is on
         is_on = any(
-            (n.inputs.get("Strength") or n.inputs.get("Emission Strength")).is_linked or
-            (n.inputs.get("Strength") or n.inputs.get("Emission Strength")).default_value > 0
-            for n in nodes_to_toggle
+            sock.is_linked or sock.default_value > 0
+            for sock in (get_emission_strength_socket(n) for n in nodes_to_toggle)
+            if sock
         )
         # Toggle nodes
         for node in nodes_to_toggle:
-            strength_socket = node.inputs.get("Strength") if node.type == 'EMISSION' else node.inputs.get("Emission Strength")
+            strength_socket = get_emission_strength_socket(node)
             if not strength_socket:
                 continue
             key = f"{mat.name}:{node.name}:Strength"
