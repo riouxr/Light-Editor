@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "LightEditor"
-version = "2.4.6"
+version = "2.4.7"
 name = "Light Editor"
 tagline = "Edit, isolate and group lights, emissive meshes and environment"
 maintainer = "Blender Bob"

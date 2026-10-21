@@ -38,6 +38,10 @@ _emissive_link_backup = {}
 # flags straight back and couple the two together.
 _syncing_visibility = False
 
+# Re-entrancy guard: set while clearing stale solo indicators, so writing
+# light_turn_off_others doesn't drive the isolate manager back into itself.
+_suppress_solo_ui_sync = False
+
 def is_blender_4_5_or_higher():
     """Check if the Blender version is 4.5 or higher."""
     return bpy.app.version >= (4, 5, 0)
@@ -70,10 +74,22 @@ class UnifiedOnOffManager:
         Turn off every light, every emissive socket (Emission nodes & Principled BSDF emission),
         and the world shader, except for the single item identified by (except_mode, except_identifier).
         """
+        # Start from a clean slate. These hold the pre-solo state, so re-entering
+        # without a restore_all() in between would record the already-off state
+        # as the thing to restore to.
+        self._light_backup.clear()
+        self._material_backup.clear()
+        self._env_backup.clear()
+
         # --- Backup & disable all lights except the isolated one ---
         keep_lights = set()
         if except_mode in {UnifiedIsolateMode.LIGHT_ROW, UnifiedIsolateMode.LIGHT_GROUP} and except_identifier:
             keep_lights = except_identifier[0]
+
+        # Materials belonging to a soloed emissive group stay lit.
+        keep_materials = set()
+        if except_mode == UnifiedIsolateMode.MATERIAL_GROUP and except_identifier:
+            keep_materials = except_identifier[1]
 
         for obj in bpy.data.objects:
             if obj.type == 'LIGHT':
@@ -99,7 +115,11 @@ class UnifiedOnOffManager:
 
                 ident = (mat.name, node.name)
 
-                if not (except_mode == UnifiedIsolateMode.MATERIAL and except_identifier == ident):
+                keep = (
+                    (except_mode == UnifiedIsolateMode.MATERIAL and except_identifier == ident)
+                    or (except_mode == UnifiedIsolateMode.MATERIAL_GROUP and mat.name in keep_materials)
+                )
+                if not keep:
                     # backup & disable
                     self._material_backup[ident] = strength_socket.default_value
                     strength_socket.default_value = 0.0
@@ -196,6 +216,15 @@ class UnifiedIsolateManager:
         return self._active_mode, self._active_identifier
 
     def activate(self, context, mode, identifier=None):
+        # Soloing is mutually exclusive. Switching straight from one soloed item
+        # to another used to re-enter here without deactivating, so the backup
+        # below captured the already-soloed (everything off) state as if it were
+        # the user's original — and un-soloing then faithfully restored "all
+        # off", with no way back. Always unwind the previous isolation first.
+        if self._active_mode is not None:
+            self.deactivate(context)
+            clear_solo_ui_state(context)
+
         self._backup.clear()
         self._active_mode = mode
         self._active_identifier = identifier
@@ -237,13 +266,36 @@ class UnifiedIsolateManager:
                     s = get_emission_strength_socket(node)
                     if s:
                         s.default_value = self._backup[(mat.name, node.name)]
-        elif mode == UnifiedIsolateMode.ENVIRONMENT:
+        elif mode == UnifiedIsolateMode.MATERIAL_GROUP:
+            # identifier is (lights, material names) — restore every emissive
+            # node belonging to a material in the soloed group.
+            _, to_keep_emissive = identifier if identifier else (set(), set())
+            for obj, mat, node in find_emissive_objects(context):
+                if mat.name in to_keep_emissive and (mat.name, node.name) in self._backup:
+                    s = get_emission_strength_socket(node)
+                    if s:
+                        s.default_value = self._backup[(mat.name, node.name)]
+        elif mode in {UnifiedIsolateMode.ENVIRONMENT,
+                      UnifiedIsolateMode.ENVIRONMENT_SURFACE,
+                      UnifiedIsolateMode.ENVIRONMENT_VOLUME}:
+            # force_all_off() disconnects both world sockets, so whichever one
+            # is being soloed has to be reconnected here. Previously only the
+            # whole-Environment mode did this, which meant soloing the Surface
+            # or Volume row just switched the environment off instead of
+            # isolating it.
+            if mode == UnifiedIsolateMode.ENVIRONMENT_SURFACE:
+                wanted = ("Surface",)
+            elif mode == UnifiedIsolateMode.ENVIRONMENT_VOLUME:
+                wanted = ("Volume",)
+            else:
+                wanted = ("Surface", "Volume")
+
             world = context.scene.world
             if world and world.use_nodes:
                 nt = world.node_tree
                 output = next((n for n in nt.nodes if n.type == 'OUTPUT_WORLD'), None)
                 if output:
-                    for name in ("Surface", "Volume"):
+                    for name in wanted:
                         if f"env_link_{name}" in self._backup:
                             from_node_name, from_socket_name = self._backup[f"env_link_{name}"]
                             from_node = nt.nodes.get(from_node_name)
@@ -350,8 +402,45 @@ def update_light_enabled(self, context):
     if self.hide_render != hidden:
         self.hide_render = hidden
 
+def clear_solo_ui_state(context):
+    """Reset every solo indicator in the UI.
+
+    Solo is mutually exclusive, so when one solo supersedes another the old
+    button must stop looking active. These flags live in assorted globals and
+    on the objects themselves, none of which the isolate manager tracks.
+    """
+    global _suppress_solo_ui_sync
+    global isolate_env_header_state, isolate_env_surface_state, isolate_env_volume_state
+    global env_isolated_ui_state
+
+    isolate_env_header_state = False
+    isolate_env_surface_state = False
+    isolate_env_volume_state = False
+    env_isolated_ui_state = False
+
+    for key in list(emissive_isolate_icon_state.keys()):
+        emissive_isolate_icon_state[key] = False
+    for key in list(group_checkbox_2_state.keys()):
+        group_checkbox_2_state[key] = False
+
+    # Writing light_turn_off_others fires update_light_turn_off_others, which
+    # would re-enter the isolate manager — suppress that while clearing.
+    _suppress_solo_ui_sync = True
+    try:
+        for obj in bpy.data.objects:
+            if obj.type == 'LIGHT' and getattr(obj, "light_turn_off_others", False):
+                obj.light_turn_off_others = False
+        if context is not None and getattr(context, "scene", None) is not None:
+            if getattr(context.scene, "current_active_light", None) is not None:
+                context.scene.current_active_light = None
+    finally:
+        _suppress_solo_ui_sync = False
+
+
 def update_light_turn_off_others(self, context):
     global group_checkbox_2_state, emissive_isolate_icon_state
+    if _suppress_solo_ui_sync:
+        return
     scene = context.scene
     world = scene.world
     nt = world.node_tree if world and world.use_nodes else None
